@@ -177,10 +177,20 @@ void _all_reduce(
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
     case at::ScalarType::BFloat16: {
-        fa->allreduce<opus::bf16_t>(stream,
-                                      reinterpret_cast<opus::bf16_t*>(inp.data_ptr()),
-                                      reinterpret_cast<opus::bf16_t*>(out.data_ptr()),
-                                      out.numel(), use_new);
+        if(open_fp8_quant && out.numel() >= 128 * 2048)
+        {
+            fa->runFp8QuantKernel<opus::bf16_t>(stream,
+                                        reinterpret_cast<opus::bf16_t*>(inp.data_ptr()),
+                                        reinterpret_cast<opus::bf16_t*>(out.data_ptr()),
+                                        out.numel());
+        }
+        else
+        {
+            fa->allreduce<opus::bf16_t>(stream,
+                                    reinterpret_cast<opus::bf16_t*>(inp.data_ptr()),
+                                    reinterpret_cast<opus::bf16_t*>(out.data_ptr()),
+                                    out.numel(), use_new, is_broadcast_reg_outptr);
+        }
         break;
     }
 #endif

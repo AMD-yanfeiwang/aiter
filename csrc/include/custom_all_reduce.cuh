@@ -907,15 +907,41 @@ struct AbsMaxFunctor
     }
 };
 
+// cross-lane butterfly shuffle (XOR) via ds_bpermute
+template<typename T>
+DINLINE T shfl_xor(T var, int mask, int width = opus::get_warp_size())
+{
+    static_assert(sizeof(T) == 4);
+    int self = opus::lane_id();
+    int index = (self & ~(width - 1)) + ((self ^ mask) & (width - 1));
+    return __builtin_bit_cast(T, __builtin_amdgcn_ds_bpermute(index << 2, __builtin_bit_cast(int, var)));
+}
+
+// shfl_xor support 4bytes dtype only
 template <template <typename> class functor, typename T, int reduce_range, int stop_stride = 0>
 DINLINE T warpReduce(T val)
 {
-    auto op = functor<T>();
-#pragma unroll
-    for(int stride = reduce_range / 2; stride > stop_stride; stride >>= 1)
+    if constexpr (sizeof(T) == 4)
     {
-        T tmp = __shfl_xor(val, stride, reduce_range);
-        val   = op(val, tmp);
+        auto op = functor<T>();
+#pragma unroll
+        for(int stride = reduce_range / 2; stride > stop_stride; stride >>= 1)
+        {
+            T tmp = shfl_xor(val, stride, reduce_range);
+            val   = op(val, tmp);
+        }
+    }
+    else
+    {
+        auto op = functor<float>();
+        float val_fp32 = upcast_s(val);
+#pragma unroll
+        for(int stride = reduce_range / 2; stride > stop_stride; stride >>= 1)
+        {
+            float tmp = shfl_xor(val_fp32, stride, reduce_range);
+            val_fp32  = op(val_fp32, tmp);
+        }
+        val = downcast_s<T>(val_fp32);
     }
     return val;
 }
@@ -977,10 +1003,9 @@ multiGPUPackReduce(const opus::vector_t<T, pack_size>* ptrs[ngpus], int index)
     return downcast<opus::vector_t<T, pack_size>>(ret_val);
 }
 
-// bf16 quant fp8 kernel function
-// too slow need to be optimized
-// fp16
-template <typename T, int quant_scale, int pack_size, int ngpus, FP16_FILTER>
+// fp8 quant all-reduce kernel function
+// supports both fp16 and bf16
+template <typename T, int quant_scale, int pack_size, int ngpus>
 __global__ __forceinline__ void __launch_bounds__(512, 1) allReduceQuantFp8(
     RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size)
 {
@@ -1040,7 +1065,9 @@ __global__ __forceinline__ void __launch_bounds__(512, 1) allReduceQuantFp8(
                 {
                     scale_factor = *(reinterpret_cast<T*>(&tmps[i][part]) + idx / factor_stride);
                 }
-                scale_factor = __shfl(scale_factor, (threadIdx.x / factor_stride) * factor_stride);
+                float scale_factor_fp32 = upcast_s(scale_factor);
+                scale_factor_fp32 = opus::shfl(scale_factor_fp32, (threadIdx.x / factor_stride) * factor_stride);
+                scale_factor = downcast_s<T>(scale_factor_fp32);
                 inp_pack half8_reg = packDequant<T, pack_size>(tmps[i][idx], scale_factor);
                 int dst_idx        = gather_from_rank * part + idx;
                 ((inp_pack*)result)[dst_idx] = half8_reg;
@@ -2237,9 +2264,10 @@ class CustomAllreduce
             blocks = std::min(kMaxBlocks,
                               (size / world_size_ + (threads / world_size_) - 1) /
                                   (threads / world_size_));
-            if(world_size_ == 8 && bytes > 512 * 4096 * 2 &&
-               arch.find("gfx942") != std::string::npos)
-            {
+
+            if (world_size_ == 8 && bytes > 512 * 4096 * 2 && (
+                    arch.find("gfx942") != std::string::npos ||
+                    arch.find("gfx950") != std::string::npos)) {
                 use_write_mode = true;
             }
         }
