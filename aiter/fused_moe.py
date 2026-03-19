@@ -784,9 +784,10 @@ def get_2stage_cfgs(
             dtypes.fp8,
             QuantType.per_1x128,
         )
-        if problem_type == bypass_type and (token * topk) <= 128:  # bypass tuned
-            aiter.logger.info("bypass tuned results for fp8 blockscale")
-            return False
+        # DISABLED: bypass causes 2stage CK crash for 256-expert per_1x128 at small tokens
+        # if problem_type == bypass_type and (token * topk) <= 128:  # bypass tuned
+            # aiter.logger.info("bypass tuned results for fp8 blockscale")
+            # return False
         return True
 
     # cfg = cfg_2stages.get(keys, None)
