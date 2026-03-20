@@ -180,9 +180,7 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
                         // This TG can process all of this qo_tile's remaining_blocks to the causal
                         // boundary
                         const int32_t partial_o_loc =
-                            (current_block_idx == 0)
-                                ? -1
-                                : (qlen_granularity * partial_tile_idx++); // -1 - no split
+                            qlen_granularity * partial_tile_idx++;
                         const int32_t kv_end =
                             std::min(kv_start + consuming_blocks,
                                      pages_kv_indptr[current_tile.batch_idx + 1]);

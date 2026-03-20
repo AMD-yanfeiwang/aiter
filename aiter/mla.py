@@ -330,6 +330,51 @@ def mla_decode_fwd(
         else:
             assert False, f"{nhead=} and {max_seqlen_q=} not supported"
 
+        # Determine if the ASM kernel requires a padded max_seqlen_q
+        # (e.g. fp8 gqa=16 persistent: msq=3 is dispatched to qseqlen=4 kernel)
+        kernel_msq = max_seqlen_q
+        gqa_ratio = nhead  # nhead_kv is always 1 for MLA
+        if persistent_mode and gqa_ratio == 16:
+            if q.dtype == dtypes.fp8:
+                if max_seqlen_q == 3:
+                    kernel_msq = 4
+            elif q.dtype == dtypes.bf16:
+                if kv_buffer.dtype in (dtypes.fp8,) or kv_buffer.dtype == dtypes.bf16:
+                    if max_seqlen_q in (3,) and max_seqlen_q <= 4:
+                        kernel_msq = 4
+
+        q_needs_padding = kernel_msq != max_seqlen_q
+        orig_max_seqlen_q = max_seqlen_q
+        orig_o = None
+
+        if q_needs_padding:
+            # Pad Q: (bs * orig_msq, nhead, dim) -> (bs * kernel_msq, nhead, dim)
+            q_dim = q.size(-1)
+            q_reshaped = q.view(bs, orig_max_seqlen_q, nhead, q_dim)
+            q_padded = torch.zeros(
+                bs, kernel_msq, nhead, q_dim, dtype=q.dtype, device=device
+            )
+            q_padded[:, :orig_max_seqlen_q] = q_reshaped
+            q = q_padded.reshape(bs * kernel_msq, nhead, q_dim)
+
+            # Rebuild qo_indptr for padded layout
+            qo_indptr = torch.arange(
+                0, (bs + 1) * kernel_msq, kernel_msq,
+                dtype=qo_indptr.dtype, device=device,
+            )
+
+            # Save original output and create padded output
+            orig_o = o
+            o = torch.empty(
+                bs * kernel_msq, ori_nhead, v_head_dim,
+                dtype=orig_o.dtype, device=device,
+            )
+
+            # Update sizes
+            total_s = bs * kernel_msq
+            ori_total_s = total_s
+            max_seqlen_q = kernel_msq
+
         logits = torch.empty(
             (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, v_head_dim),
             dtype=dtypes.fp32,
@@ -404,6 +449,17 @@ def mla_decode_fwd(
             o,
             final_lse,
         )
+
+        # Unpad output if Q was padded
+        if q_needs_padding and orig_o is not None:
+            o_reshaped = o.view(bs, kernel_msq, ori_nhead, v_head_dim)
+            orig_o[:] = o_reshaped[:, :orig_max_seqlen_q].reshape(
+                -1, ori_nhead, v_head_dim
+            )
+            o = orig_o
+            total_s = bs * orig_max_seqlen_q
+            ori_total_s = total_s
+            max_seqlen_q = orig_max_seqlen_q
 
     if io_transformed:
         if return_logits:

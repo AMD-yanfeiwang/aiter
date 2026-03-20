@@ -317,6 +317,14 @@ void mla_decode_stage1_asm_fwd(
         }
     }
 
+    // When config_max_seqlen_q differs from max_seqlen_q (e.g. 3->4 padding),
+    // update kernel args to match the selected kernel's expected layout.
+    if(config_max_seqlen_q != max_seqlen_q && config_max_seqlen_q > 0 && persistent)
+    {
+        args.s_MQA  = gqa_ratio * config_max_seqlen_q;
+        args.s_Q_Bs = Q.stride(0) * Q.itemsize() * config_max_seqlen_q;
+    }
+
     std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map);
     
     TORCH_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");

@@ -217,8 +217,16 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     }
                     else
                     {
-                        work_info.partial_qo_loc                       = -1;
-                        params.p_reduce_indptr[global_qo_tile_idx + 1] = last_reduce_indptr;
+                        // No split: treat as single-split to avoid partial_qo_loc=-1
+                        // which is not handled by all ASM kernels (e.g. qh64)
+                        work_info.partial_qo_loc = partial_idx;
+
+                        // set reduce info for single-split
+                        params.p_reduce_indptr[global_qo_tile_idx + 1] =
+                            last_reduce_indptr + 1;
+                        params.p_reduce_final_map[global_qo_tile_idx * 2]     = work_info.qo_start;
+                        params.p_reduce_final_map[global_qo_tile_idx * 2 + 1] = work_info.qo_end;
+                        params.p_reduce_partial_map[last_reduce_indptr] = partial_idx;
                     }
 
                     p_work_info_set[num_works] = work_info;
@@ -238,6 +246,9 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                 else
                 {
                     fill_work_info(0);
+                    // Always allocate partial buffer for nosplit (single-split)
+                    partial_idx += qo_tile_size;
+                    last_reduce_indptr += 1;
                 }
 
                 tot_qo_tiles += 1;
