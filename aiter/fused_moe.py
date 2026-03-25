@@ -1707,13 +1707,16 @@ def ck_moe_stage1(
 ):
     token_num = hidden_states.shape[0]
     is_splitk = quant_type is aiter.QuantType.per_1x128 and splitk > 1
-    tmp_out = (
-        torch.zeros(
-            (token_num, topk, w1.shape[1]), dtype=dtypes.fp32, device=out.device
+    if is_splitk:
+        # CK kernel uses sorted_size = min(token * topk * block_m, len(sorted_token_ids))
+        # as M dimension, and hipMemsetAsync zeroes sorted_size * N * sizeof(float) * 2.
+        # Must allocate tmp_out large enough for sorted_size rows, not just token*topk.
+        sorted_size = min(token_num * topk * block_m, sorted_token_ids.shape[0])
+        tmp_out = torch.zeros(
+            (sorted_size, w1.shape[1]), dtype=dtypes.fp32, device=out.device
         )
-        if is_splitk
-        else out
-    )
+    else:
+        tmp_out = out
     aiter.ck_moe_stage1_fwd(
         hidden_states,
         w1,
