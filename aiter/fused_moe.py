@@ -542,25 +542,10 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
     aiter_ksplit = int(os.environ.get("AITER_KSPLIT", "0"))
     if aiter_ksplit != 0:
         return aiter_ksplit
-    # only for moe_blk gemm1 a8w8 decode scenario
-    if token * topk > expert:
-        return 0
-    cu_num = get_cu_num()
-    tileN = 128
-
-    tgM = token * topk  # decode tile num
-    tgN = (inter_dim + tileN - 1) // tileN
-
-    tg_num = tgN * tgM
-    # if all cu already active
-    if tg_num >= cu_num:
-        return 0
-    tilek = 256
-    split_max = (cu_num + tg_num - 1) // tg_num
-    # at least split = 2
-    for i in reversed(range(2, split_max + 1)):
-        if (model_dim % i == 0) and ((model_dim // i) % tilek == 0):
-            return i
+    # Disable split-K: when splitk>1, CK kernel hipMemsetAsync zeroes
+    # sorted_size * N * sizeof(float) * 2 bytes, but Python allocates only
+    # token * topk * N * sizeof(float), causing buffer overflow when
+    # sorted_size (= token * topk * block_m) >> token * topk.
     return 0
 
 
