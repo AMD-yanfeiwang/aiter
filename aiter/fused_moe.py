@@ -542,6 +542,11 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
     aiter_ksplit = int(os.environ.get("AITER_KSPLIT", "0"))
     if aiter_ksplit != 0:
         return aiter_ksplit
+    # Splitk output buffer is sized as (token*topk, dim) but the kernel operates
+    # on sorted_size = token*topk*block_m rows. For very small token counts,
+    # this causes the kernel to write past the output buffer (hipMemsetAsync overflow).
+    if token <= 1:
+        return 0
     # only for moe_blk gemm1 a8w8 decode scenario
     if token * topk > expert:
         return 0
@@ -901,6 +906,10 @@ def get_2stage_cfgs(
                 else ksplit
             )
         )
+        # Disable splitk for very small token counts where block_m padding
+        # makes sorted_size >> token*topk, causing output buffer overflow.
+        if ksplit > 0 and token <= block_m:
+            ksplit = 0
         use_non_temporal_load = use_nt(token, topk, expert)
         aiter.logger.info(
             f"run_1stage = {run_1stage}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
