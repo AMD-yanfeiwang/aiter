@@ -100,6 +100,8 @@ def compile_moe_gemm1(
     group_size: int = -1,
     out_dtype: str = "f16",
     use_cshuffle_epilog: bool | None = None,
+    num_b_tensors: int = 1,
+    b_tensor_l_offsets: tuple = (0, 1073741824, 1073741824, 1073741824, 1073741824),
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
@@ -226,6 +228,7 @@ def compile_moe_gemm1(
         f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"_abi3"  # also mask sentinel token ids on loads (X/scale_x) to avoid illegal address faults
+        f"_b{num_b_tensors}"  # multi-B DWDP support
     ).replace("-", "_")
 
     # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
@@ -248,9 +251,15 @@ def compile_moe_gemm1(
         def moe_gemm1(
             arg_out: fx.Tensor,
             arg_x: fx.Tensor,
-            arg_w: fx.Tensor,
+            arg_w_0: fx.Tensor,
+            arg_w_1: fx.Tensor,
+            arg_w_2: fx.Tensor,
+            arg_w_3: fx.Tensor,
             arg_scale_x: fx.Tensor,
-            arg_scale_w: fx.Tensor,
+            arg_scale_w_0: fx.Tensor,
+            arg_scale_w_1: fx.Tensor,
+            arg_scale_w_2: fx.Tensor,
+            arg_scale_w_3: fx.Tensor,
             arg_sorted_token_ids: fx.Tensor,
             arg_expert_ids: fx.Tensor,
             arg_sorted_weights: fx.Tensor,
@@ -384,7 +393,12 @@ def compile_moe_gemm1(
                     arg_x, max_size=False, num_records_bytes=x_nbytes_idx
                 )
 
-                w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
+                # Multi-B: create buffer resources for each weight partition
+                w_rsrc_0 = buffer_ops.create_buffer_resource(arg_w_0, max_size=False)
+                w_rsrc_1 = buffer_ops.create_buffer_resource(arg_w_1, max_size=False) if num_b_tensors > 1 else w_rsrc_0
+                w_rsrc_2 = buffer_ops.create_buffer_resource(arg_w_2, max_size=False) if num_b_tensors > 2 else w_rsrc_0
+                w_rsrc_3 = buffer_ops.create_buffer_resource(arg_w_3, max_size=False) if num_b_tensors > 3 else w_rsrc_0
+                w_rsrc = w_rsrc_0
 
                 # OUT: [tokens, topk, inter] f16/bf16 -> bytes = tokens*topk*inter*out_elem_bytes
                 out_elem_bytes = 2  # f16/bf16
@@ -408,9 +422,13 @@ def compile_moe_gemm1(
                 if not needs_scale_w:
                     sw_rsrc = None
                 else:
-                    sw_rsrc = buffer_ops.create_buffer_resource(
-                        arg_scale_w, max_size=False
+                    sw_rsrc_0 = buffer_ops.create_buffer_resource(
+                        arg_scale_w_0, max_size=False
                     )
+                    sw_rsrc_1 = buffer_ops.create_buffer_resource(arg_scale_w_1, max_size=False) if num_b_tensors > 1 else sw_rsrc_0
+                    sw_rsrc_2 = buffer_ops.create_buffer_resource(arg_scale_w_2, max_size=False) if num_b_tensors > 2 else sw_rsrc_0
+                    sw_rsrc_3 = buffer_ops.create_buffer_resource(arg_scale_w_3, max_size=False) if num_b_tensors > 3 else sw_rsrc_0
+                    sw_rsrc = sw_rsrc_0
 
                 sorted_rsrc = buffer_ops.create_buffer_resource(
                     arg_sorted_token_ids, max_size=False
@@ -432,7 +450,52 @@ def compile_moe_gemm1(
                 )
                 expert_idx = arith.index_cast(T.index, expert_i32)
                 inter2_idx = arith.index(2 * inter_dim)
-                expert_off_idx = expert_idx * inter2_idx  # index
+                # Multi-B expert dispatch: select correct weight buffer and local expert offset
+                if num_b_tensors == 1:
+                    expert_off_idx = expert_idx * inter2_idx
+                else:
+                    _local_0 = expert_idx
+                    _off_0 = _local_0 * inter2_idx
+                    if num_b_tensors >= 2:
+                        _thresh_1 = arith.index(b_tensor_l_offsets[1])
+                        _local_1 = expert_idx - _thresh_1
+                        _off_1 = _local_1 * inter2_idx
+                        _in_p0 = arith.cmpi(arith.CmpIPredicate.ult, expert_idx, _thresh_1)
+                    if num_b_tensors >= 3:
+                        _thresh_2 = arith.index(b_tensor_l_offsets[2])
+                        _local_2 = expert_idx - _thresh_2
+                        _off_2 = _local_2 * inter2_idx
+                        _in_p01 = arith.cmpi(arith.CmpIPredicate.ult, expert_idx, _thresh_2)
+                    if num_b_tensors >= 4:
+                        _thresh_3 = arith.index(b_tensor_l_offsets[3])
+                        _local_3 = expert_idx - _thresh_3
+                        _off_3 = _local_3 * inter2_idx
+                        _in_p012 = arith.cmpi(arith.CmpIPredicate.ult, expert_idx, _thresh_3)
+                    # Select expert_off_idx and w_rsrc using nested arith.select
+                    if num_b_tensors == 2:
+                        expert_off_idx = _in_p0.select(_off_0, _off_1)
+                        w_rsrc = _in_p0.select(w_rsrc_0, w_rsrc_1)
+                        if needs_scale_w:
+                            sw_rsrc = _in_p0.select(sw_rsrc_0, sw_rsrc_1)
+                    elif num_b_tensors == 3:
+                        _off_12 = _in_p01.select(_off_1, _off_2)
+                        expert_off_idx = _in_p0.select(_off_0, _off_12)
+                        _w_12 = _in_p01.select(w_rsrc_1, w_rsrc_2)
+                        w_rsrc = _in_p0.select(w_rsrc_0, _w_12)
+                        if needs_scale_w:
+                            _sw_12 = _in_p01.select(sw_rsrc_1, sw_rsrc_2)
+                            sw_rsrc = _in_p0.select(sw_rsrc_0, _sw_12)
+                    elif num_b_tensors == 4:
+                        _off_23 = _in_p012.select(_off_2, _off_3)
+                        _off_123 = _in_p01.select(_off_1, _off_23)
+                        expert_off_idx = _in_p0.select(_off_0, _off_123)
+                        _w_23 = _in_p012.select(w_rsrc_2, w_rsrc_3)
+                        _w_123 = _in_p01.select(w_rsrc_1, _w_23)
+                        w_rsrc = _in_p0.select(w_rsrc_0, _w_123)
+                        if needs_scale_w:
+                            _sw_23 = _in_p012.select(sw_rsrc_2, sw_rsrc_3)
+                            _sw_123 = _in_p01.select(sw_rsrc_1, _sw_23)
+                            sw_rsrc = _in_p0.select(sw_rsrc_0, _sw_123)
 
                 # ---- X gmem->reg prefetch (match preshuffle GEMM mapping) ----
                 # Prefer 16B buffer-load (dwordx4). If the per-thread byte count isn't divisible by
@@ -622,7 +685,7 @@ def compile_moe_gemm1(
                         buffer_ops,
                         arith,
                         vector,
-                        arg_b=arg_w,
+                        arg_b=arg_w_0,
                         b_rsrc=w_rsrc,
                         layout_b=layout_b,
                         base_k=base_k,
@@ -653,7 +716,7 @@ def compile_moe_gemm1(
                                     buffer_ops,
                                     arith,
                                     vector,
-                                    arg_b=arg_w,
+                                    arg_b=arg_w_0,
                                     b_rsrc=w_rsrc,
                                     layout_b=layout_b,
                                     base_k=base_k,
@@ -1074,7 +1137,7 @@ def compile_moe_gemm1(
                 # Epilogue hoists to keep IR + Python build time small:
                 col_i32_list = []
                 for ni in range_constexpr(num_acc_n):
-                    col_i32_list.append(arith.index_cast(i32, col_g_list[ni]))
+                    col_i32_list.append(arith.index_cast(T.i32, col_g_list[ni]))
 
                 inter_i32_local = inter_i32_v
 
@@ -1319,9 +1382,15 @@ def compile_moe_gemm1(
     def launch_moe_gemm1(
         arg_out: fx.Tensor,
         arg_x: fx.Tensor,
-        arg_w: fx.Tensor,
+        arg_w_0: fx.Tensor,
+        arg_w_1: fx.Tensor,
+        arg_w_2: fx.Tensor,
+        arg_w_3: fx.Tensor,
         arg_scale_x: fx.Tensor,
-        arg_scale_w: fx.Tensor,
+        arg_scale_w_0: fx.Tensor,
+        arg_scale_w_1: fx.Tensor,
+        arg_scale_w_2: fx.Tensor,
+        arg_scale_w_3: fx.Tensor,
         arg_sorted_token_ids: fx.Tensor,
         arg_expert_ids: fx.Tensor,
         arg_sorted_weights: fx.Tensor,
@@ -1345,9 +1414,9 @@ def compile_moe_gemm1(
         moe_gemm1(
             arg_out,
             arg_x,
-            arg_w,
+            arg_w_0, arg_w_1, arg_w_2, arg_w_3,
             arg_scale_x,
-            arg_scale_w,
+            arg_scale_w_0, arg_scale_w_1, arg_scale_w_2, arg_scale_w_3,
             arg_sorted_token_ids,
             arg_expert_ids,
             arg_sorted_weights,
@@ -1381,6 +1450,8 @@ def compile_moe_gemm2(
     out_dtype: str = "f16",
     use_cshuffle_epilog: bool | None = None,
     accumulate: bool = True,
+    num_b_tensors: int = 1,
+    b_tensor_l_offsets: tuple = (0, 1073741824, 1073741824, 1073741824, 1073741824),
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -1534,6 +1605,7 @@ def compile_moe_gemm2(
         f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"_abi2"  # mask sentinel token ids on loads/stores to avoid illegal address faults
+        f"_b{num_b_tensors}"  # multi-B DWDP support
     ).replace("-", "_")
 
     # ── CShuffle epilogue e_vec (pure Python; must be computed before @flyc.kernel
@@ -1568,9 +1640,15 @@ def compile_moe_gemm2(
         def moe_gemm2(
             arg_out: fx.Tensor,
             arg_x: fx.Tensor,
-            arg_w: fx.Tensor,
+            arg_w_0: fx.Tensor,
+            arg_w_1: fx.Tensor,
+            arg_w_2: fx.Tensor,
+            arg_w_3: fx.Tensor,
             arg_scale_x: fx.Tensor,
-            arg_scale_w: fx.Tensor,
+            arg_scale_w_0: fx.Tensor,
+            arg_scale_w_1: fx.Tensor,
+            arg_scale_w_2: fx.Tensor,
+            arg_scale_w_3: fx.Tensor,
             arg_sorted_token_ids: fx.Tensor,
             arg_expert_ids: fx.Tensor,
             arg_sorted_weights: fx.Tensor,
@@ -1674,7 +1752,12 @@ def compile_moe_gemm2(
                 arg_x, max_size=False, num_records_bytes=x_nbytes_idx
             )
 
-            w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
+            # Multi-B: create buffer resources for each weight partition
+            w_rsrc_0 = buffer_ops.create_buffer_resource(arg_w_0, max_size=False)
+            w_rsrc_1 = buffer_ops.create_buffer_resource(arg_w_1, max_size=False) if num_b_tensors > 1 else w_rsrc_0
+            w_rsrc_2 = buffer_ops.create_buffer_resource(arg_w_2, max_size=False) if num_b_tensors > 2 else w_rsrc_0
+            w_rsrc_3 = buffer_ops.create_buffer_resource(arg_w_3, max_size=False) if num_b_tensors > 3 else w_rsrc_0
+            w_rsrc = w_rsrc_0
 
             # OUT: [tokens, model_dim] -> clamp to descriptor max (i32 bytes) to avoid overflow on huge tokens.
             out_elem_bytes = 4 if out_is_f32 else 2
@@ -1700,7 +1783,11 @@ def compile_moe_gemm2(
                 sw_rsrc = None
             else:
                 # scale_w: [experts*model_dim] f32 (static shape in practice)
-                sw_rsrc = buffer_ops.create_buffer_resource(arg_scale_w, max_size=False)
+                sw_rsrc_0 = buffer_ops.create_buffer_resource(arg_scale_w_0, max_size=False)
+                sw_rsrc_1 = buffer_ops.create_buffer_resource(arg_scale_w_1, max_size=False) if num_b_tensors > 1 else sw_rsrc_0
+                sw_rsrc_2 = buffer_ops.create_buffer_resource(arg_scale_w_2, max_size=False) if num_b_tensors > 2 else sw_rsrc_0
+                sw_rsrc_3 = buffer_ops.create_buffer_resource(arg_scale_w_3, max_size=False) if num_b_tensors > 3 else sw_rsrc_0
+                sw_rsrc = sw_rsrc_0
 
             # sorted_token_ids / sorted_weights: [blocks*tile_m] (CK-style padded length)
             sorted_nbytes_idx = size_expert_ids_in * fx.Index(tile_m) * fx.Index(4)
@@ -1734,13 +1821,58 @@ def compile_moe_gemm2(
             blk_valid = arith.cmpi(arith.CmpIPredicate.ult, bx_m_i32, num_valid_i32)
 
             def _moe_gemm2_then_body():
+                nonlocal w_rsrc, sw_rsrc
                 # Expert id for this M tile.
                 expert_i32 = buffer_ops.buffer_load(
                     expert_rsrc, bx, vec_width=1, dtype=T.i32
                 )
                 expert_idx = arith.index_cast(T.index, expert_i32)
                 n_idx = fx.Index(model_dim)
-                expert_off_idx = expert_idx * n_idx  # index
+                # Multi-B expert dispatch: select correct weight buffer and local expert offset
+                if num_b_tensors == 1:
+                    expert_off_idx = expert_idx * n_idx
+                else:
+                    _local_0 = expert_idx
+                    _off_0 = _local_0 * n_idx
+                    if num_b_tensors >= 2:
+                        _thresh_1 = arith.index(b_tensor_l_offsets[1])
+                        _local_1 = expert_idx - _thresh_1
+                        _off_1 = _local_1 * n_idx
+                        _in_p0 = arith.cmpi(arith.CmpIPredicate.ult, expert_idx, _thresh_1)
+                    if num_b_tensors >= 3:
+                        _thresh_2 = arith.index(b_tensor_l_offsets[2])
+                        _local_2 = expert_idx - _thresh_2
+                        _off_2 = _local_2 * n_idx
+                        _in_p01 = arith.cmpi(arith.CmpIPredicate.ult, expert_idx, _thresh_2)
+                    if num_b_tensors >= 4:
+                        _thresh_3 = arith.index(b_tensor_l_offsets[3])
+                        _local_3 = expert_idx - _thresh_3
+                        _off_3 = _local_3 * n_idx
+                        _in_p012 = arith.cmpi(arith.CmpIPredicate.ult, expert_idx, _thresh_3)
+                    if num_b_tensors == 2:
+                        expert_off_idx = _in_p0.select(_off_0, _off_1)
+                        w_rsrc = _in_p0.select(w_rsrc_0, w_rsrc_1)
+                        if needs_scale_w:
+                            sw_rsrc = _in_p0.select(sw_rsrc_0, sw_rsrc_1)
+                    elif num_b_tensors == 3:
+                        _off_12 = _in_p01.select(_off_1, _off_2)
+                        expert_off_idx = _in_p0.select(_off_0, _off_12)
+                        _w_12 = _in_p01.select(w_rsrc_1, w_rsrc_2)
+                        w_rsrc = _in_p0.select(w_rsrc_0, _w_12)
+                        if needs_scale_w:
+                            _sw_12 = _in_p01.select(sw_rsrc_1, sw_rsrc_2)
+                            sw_rsrc = _in_p0.select(sw_rsrc_0, _sw_12)
+                    elif num_b_tensors == 4:
+                        _off_23 = _in_p012.select(_off_2, _off_3)
+                        _off_123 = _in_p01.select(_off_1, _off_23)
+                        expert_off_idx = _in_p0.select(_off_0, _off_123)
+                        _w_23 = _in_p012.select(w_rsrc_2, w_rsrc_3)
+                        _w_123 = _in_p01.select(w_rsrc_1, _w_23)
+                        w_rsrc = _in_p0.select(w_rsrc_0, _w_123)
+                        if needs_scale_w:
+                            _sw_23 = _in_p012.select(sw_rsrc_2, sw_rsrc_3)
+                            _sw_123 = _in_p01.select(sw_rsrc_1, _sw_23)
+                            sw_rsrc = _in_p0.select(sw_rsrc_0, _sw_123)
 
                 # ---- X gmem->reg prefetch (match preshuffle GEMM mapping) ----
                 # Prefer 16B buffer-load (dwordx4). If the per-thread byte count isn't divisible by
@@ -1905,7 +2037,7 @@ def compile_moe_gemm2(
                         buffer_ops,
                         arith,
                         vector,
-                        arg_b=arg_w,
+                        arg_b=arg_w_0,
                         b_rsrc=w_rsrc,
                         layout_b=layout_b,
                         base_k=base_k,
@@ -1935,7 +2067,7 @@ def compile_moe_gemm2(
                                     buffer_ops,
                                     arith,
                                     vector,
-                                    arg_b=arg_w,
+                                    arg_b=arg_w_0,
                                     b_rsrc=w_rsrc,
                                     layout_b=layout_b,
                                     base_k=base_k,
@@ -2649,9 +2781,15 @@ def compile_moe_gemm2(
     def launch_moe_gemm2(
         arg_out: fx.Tensor,
         arg_x: fx.Tensor,
-        arg_w: fx.Tensor,
+        arg_w_0: fx.Tensor,
+        arg_w_1: fx.Tensor,
+        arg_w_2: fx.Tensor,
+        arg_w_3: fx.Tensor,
         arg_scale_x: fx.Tensor,
-        arg_scale_w: fx.Tensor,
+        arg_scale_w_0: fx.Tensor,
+        arg_scale_w_1: fx.Tensor,
+        arg_scale_w_2: fx.Tensor,
+        arg_scale_w_3: fx.Tensor,
         arg_sorted_token_ids: fx.Tensor,
         arg_expert_ids: fx.Tensor,
         arg_sorted_weights: fx.Tensor,
@@ -2675,9 +2813,9 @@ def compile_moe_gemm2(
         moe_gemm2(
             arg_out,
             arg_x,
-            arg_w,
+            arg_w_0, arg_w_1, arg_w_2, arg_w_3,
             arg_scale_x,
-            arg_scale_w,
+            arg_scale_w_0, arg_scale_w_1, arg_scale_w_2, arg_scale_w_3,
             arg_sorted_token_ids,
             arg_expert_ids,
             arg_sorted_weights,
@@ -3011,12 +3149,20 @@ class _MoeGemm2ReduceWrapper:
         if self._zero_intermediate and not self._use_mask:
             intermediate.zero_()
         # Phase 1: GEMM2 (no atomics) -> [tokens*topk, model_dim]
+        # Multi-B: pad single tensor to 4-tensor arg list
+        import torch as _torch
+        _aw = arg_w if isinstance(arg_w, (list, tuple)) else [arg_w]
+        _asw = arg_scale_w if isinstance(arg_scale_w, (list, tuple)) else [arg_scale_w]
+        _empty_w = _torch.empty(0, device=arg_out.device, dtype=_aw[0].dtype)
+        _empty_sw = _torch.empty(0, device=arg_out.device, dtype=_asw[0].dtype) if _asw[0].numel() > 0 else _torch.empty(0, device=arg_out.device)
+        _aw_pad = _aw + [_empty_w] * (4 - len(_aw))
+        _asw_pad = _asw + [_empty_sw] * (4 - len(_asw))
         self._gemm2_exe(
             intermediate.view(-1),
             arg_x,
-            arg_w,
+            _aw_pad[0], _aw_pad[1], _aw_pad[2], _aw_pad[3],
             arg_scale_x,
-            arg_scale_w,
+            _asw_pad[0], _asw_pad[1], _asw_pad[2], _asw_pad[3],
             arg_sorted_token_ids,
             arg_expert_ids,
             arg_sorted_weights,

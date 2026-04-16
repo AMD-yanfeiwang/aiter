@@ -184,6 +184,8 @@ def compile_flydsl_moe_stage1(
     waves_per_eu: int = 3,
     b_nt: int = 2,
     gate_only: bool = False,
+    num_b_tensors: int = 1,
+    b_tensor_l_offsets: tuple = (0, 1073741824, 1073741824, 1073741824, 1073741824),
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -210,6 +212,8 @@ def compile_flydsl_moe_stage1(
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
             gate_only=gate_only,
+            num_b_tensors=num_b_tensors,
+            b_tensor_l_offsets=b_tensor_l_offsets,
         )
     else:
         from .kernels.moe_gemm_2stage import compile_moe_gemm1
@@ -225,6 +229,8 @@ def compile_flydsl_moe_stage1(
             doweight_stage1=doweight_stage1,
             in_dtype=a_dtype,
             out_dtype=out_dtype,
+            num_b_tensors=num_b_tensors,
+            b_tensor_l_offsets=b_tensor_l_offsets,
         )
 
 
@@ -243,6 +249,8 @@ def compile_flydsl_moe_stage2(
     accumulate: bool = True,
     persist_m: int = 1,
     sort_block_m: int = 0,
+    num_b_tensors: int = 1,
+    b_tensor_l_offsets: tuple = (0, 1073741824, 1073741824, 1073741824, 1073741824),
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -263,6 +271,8 @@ def compile_flydsl_moe_stage2(
             accumulate=accumulate,
             persist_m=persist_m,
             sort_block_m=sort_block_m,
+            num_b_tensors=num_b_tensors,
+            b_tensor_l_offsets=b_tensor_l_offsets,
         )
     else:
         from .kernels.moe_gemm_2stage import compile_moe_gemm2
@@ -279,6 +289,8 @@ def compile_flydsl_moe_stage2(
             in_dtype=a_dtype,
             out_dtype=out_dtype,
             accumulate=accumulate,
+            num_b_tensors=num_b_tensors,
+            b_tensor_l_offsets=b_tensor_l_offsets,
         )
 
 
@@ -300,9 +312,9 @@ def _view_safe(t: torch.Tensor) -> torch.Tensor:
 def _s1_args_fp4(
     out,
     a,
-    w,
+    w_list,
     a_scale,
-    w_scale,
+    w_scale_list,
     sorted_ids,
     sorted_expert_ids,
     sorted_weights,
@@ -318,9 +330,9 @@ def _s1_args_fp4(
     return (
         _view_safe(out),
         _view_safe(a),
-        _view_safe(w),
+        _view_safe(w_list[0]), _view_safe(w_list[1]), _view_safe(w_list[2]), _view_safe(w_list[3]),
         _view_safe(a_scale),
-        _view_safe(w_scale),
+        _view_safe(w_scale_list[0]), _view_safe(w_scale_list[1]), _view_safe(w_scale_list[2]), _view_safe(w_scale_list[3]),
         sorted_ids,
         sorted_expert_ids,
         sorted_weights,
@@ -338,9 +350,9 @@ def _s1_args_fp4(
 def _s1_args_std(
     out,
     a,
-    w,
+    w_list,
     a_scale,
-    w_scale,
+    w_scale_list,
     sorted_ids,
     sorted_expert_ids,
     sorted_weights,
@@ -353,9 +365,9 @@ def _s1_args_std(
     return (
         out,
         a,
-        w,
+        w_list[0], w_list[1], w_list[2], w_list[3],
         a_scale,
-        w_scale,
+        w_scale_list[0], w_scale_list[1], w_scale_list[2], w_scale_list[3],
         sorted_ids,
         sorted_expert_ids,
         sorted_weights,
@@ -371,9 +383,9 @@ def _s1_args_std(
 def _s2_args_fp4(
     target,
     a,
-    w,
+    w_list,
     a_scale,
-    w_scale,
+    w_scale_list,
     sorted_ids,
     sorted_expert_ids,
     sorted_weights,
@@ -388,9 +400,9 @@ def _s2_args_fp4(
     return (
         _view_safe(target),
         _view_safe(a),
-        _view_safe(w),
+        _view_safe(w_list[0]), _view_safe(w_list[1]), _view_safe(w_list[2]), _view_safe(w_list[3]),
         _view_safe(a_scale),
-        _view_safe(w_scale),
+        _view_safe(w_scale_list[0]), _view_safe(w_scale_list[1]), _view_safe(w_scale_list[2]), _view_safe(w_scale_list[3]),
         sorted_ids,
         sorted_expert_ids,
         sorted_weights,
@@ -407,9 +419,9 @@ def _s2_args_fp4(
 def _s2_args_std(
     target,
     a,
-    w,
+    w_list,
     a_scale,
-    w_scale,
+    w_scale_list,
     sorted_ids,
     sorted_expert_ids,
     sorted_weights,
@@ -422,9 +434,9 @@ def _s2_args_std(
     return (
         target,
         a,
-        w,
+        w_list[0], w_list[1], w_list[2], w_list[3],
         a_scale,
-        w_scale,
+        w_scale_list[0], w_scale_list[1], w_scale_list[2], w_scale_list[3],
         sorted_ids,
         sorted_expert_ids,
         sorted_weights,
@@ -462,7 +474,7 @@ def _get_compiled_silu_fq(inter_dim: int, topk: int):
 
 def flydsl_moe_stage1(
     a: torch.Tensor,
-    w1: torch.Tensor,
+    w1,  # torch.Tensor or List[torch.Tensor] for multi-B DWDP
     sorted_token_ids: torch.Tensor,
     sorted_expert_ids: torch.Tensor,
     num_valid_ids: torch.Tensor,
@@ -487,6 +499,8 @@ def flydsl_moe_stage1(
     waves_per_eu: int = 3,
     b_nt: int = 2,
     gate_only: bool = False,
+    num_b_tensors: int = 0,
+    b_tensor_l_offsets: tuple = (),
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -508,9 +522,34 @@ def flydsl_moe_stage1(
         Basic:                      out
         fuse_sort_scale:            (out, out_scale_sorted)
     """
+    # Multi-B normalization: accept single tensor or list of tensors
+    if isinstance(w1, (list, tuple)):
+        w1_list = list(w1)
+    else:
+        w1_list = [w1]
+    if num_b_tensors == 0:
+        num_b_tensors = len(w1_list)
+    assert 1 <= num_b_tensors <= 4, f"num_b_tensors must be 1..4, got {num_b_tensors}"
+    assert len(w1_list) == num_b_tensors, f"Expected {num_b_tensors} weight tensors, got {len(w1_list)}"
+    # Compute b_tensor_l_offsets from cumulative expert counts
+    if not b_tensor_l_offsets:
+        _offsets = [0]
+        for _wt in w1_list[:-1]:
+            _offsets.append(_offsets[-1] + _wt.shape[0])
+        _offsets += [1073741824] * (5 - len(_offsets))
+        b_tensor_l_offsets = tuple(_offsets)
+    # Total experts = sum of per-partition expert counts
+    _total_experts = sum(_wt.shape[0] for _wt in w1_list)
+    # Normalize w1_scale similarly
+    if isinstance(w1_scale, (list, tuple)):
+        w1_scale_list = list(w1_scale)
+    else:
+        w1_scale_list = [w1_scale] if w1_scale is not None else [None]
+        w1_scale_list = w1_scale_list * num_b_tensors
+
     token_num = a.shape[0]
-    E = w1.shape[0]
-    inter_dim = w1.shape[1] // 2
+    E = _total_experts
+    inter_dim = w1_list[0].shape[1] // 2
     model_dim = a.shape[1]
 
     if a_dtype == "fp4":
@@ -547,9 +586,14 @@ def flydsl_moe_stage1(
     flat_a_scale = (
         a1_scale.view(-1) if a1_scale is not None else torch.empty(0, device=dev)
     )
-    flat_w_scale = (
-        w1_scale.view(-1) if w1_scale is not None else torch.empty(0, device=dev)
-    )
+    # Pad weight tensor lists to 4 for kernel arg passing
+    # Use uint8 for padding to avoid dlpack issues with fp4 types
+    _empty_w1 = torch.empty(0, device=dev, dtype=torch.uint8)
+    _w1_padded = [_wt.view(-1) for _wt in w1_list] + [_empty_w1] * (4 - num_b_tensors)
+    _empty_ws1 = torch.empty(0, device=dev)
+    _ws1_padded = [
+        (_ws.view(-1) if _ws is not None else _empty_ws1) for _ws in w1_scale_list
+    ] + [_empty_ws1] * (4 - num_b_tensors)
     sw = (
         sorted_weights
         if sorted_weights is not None
@@ -596,9 +640,9 @@ def flydsl_moe_stage1(
         args = _s1_args_fp4(
             _kernel_out.view(-1),
             a.view(-1),
-            w1.view(-1),
+            _w1_padded,
             flat_a_scale,
-            flat_w_scale,
+            _ws1_padded,
             sorted_token_ids,
             sorted_expert_ids,
             sw,
@@ -614,9 +658,9 @@ def flydsl_moe_stage1(
         args = _s1_args_std(
             _kernel_out.view(-1),
             a.view(-1),
-            w1.view(-1),
+            _w1_padded,
             flat_a_scale,
-            flat_w_scale,
+            _ws1_padded,
             sorted_token_ids,
             sorted_expert_ids,
             sw,
@@ -630,7 +674,7 @@ def flydsl_moe_stage1(
     exe = compile_flydsl_moe_stage1(
         model_dim=model_dim,
         inter_dim=inter_dim,
-        experts=E,
+        experts=E,  # total experts across all B partitions
         topk=topk,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -648,6 +692,8 @@ def flydsl_moe_stage1(
         waves_per_eu=waves_per_eu,
         b_nt=b_nt,
         gate_only=gate_only,
+        num_b_tensors=num_b_tensors,
+        b_tensor_l_offsets=b_tensor_l_offsets,
     )
     _run_compiled(exe, args)
 
@@ -685,7 +731,7 @@ def flydsl_moe_stage1(
 
 def flydsl_moe_stage2(
     inter_states: torch.Tensor,
-    w2: torch.Tensor,
+    w2,  # torch.Tensor or List[torch.Tensor] for multi-B DWDP
     sorted_token_ids: torch.Tensor,
     sorted_expert_ids: torch.Tensor,
     num_valid_ids: torch.Tensor,
@@ -704,6 +750,8 @@ def flydsl_moe_stage2(
     sorted_weights: Optional[torch.Tensor] = None,
     sort_block_m: int = 0,
     persist: Optional[bool] = None,
+    num_b_tensors: int = 0,
+    b_tensor_l_offsets: tuple = (),
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -717,9 +765,31 @@ def flydsl_moe_stage2(
         if False, use legacy persist_m mode; if None, auto-select.
     """
 
+    # Multi-B normalization
+    if isinstance(w2, (list, tuple)):
+        w2_list = list(w2)
+    else:
+        w2_list = [w2]
+    if num_b_tensors == 0:
+        num_b_tensors = len(w2_list)
+    assert 1 <= num_b_tensors <= 4, f"num_b_tensors must be 1..4, got {num_b_tensors}"
+    assert len(w2_list) == num_b_tensors
+    if not b_tensor_l_offsets:
+        _offsets = [0]
+        for _wt in w2_list[:-1]:
+            _offsets.append(_offsets[-1] + _wt.shape[0])
+        _offsets += [1073741824] * (5 - len(_offsets))
+        b_tensor_l_offsets = tuple(_offsets)
+    _total_experts = sum(_wt.shape[0] for _wt in w2_list)
+    if isinstance(w2_scale, (list, tuple)):
+        w2_scale_list = list(w2_scale)
+    else:
+        w2_scale_list = [w2_scale] if w2_scale is not None else [None]
+        w2_scale_list = w2_scale_list * num_b_tensors
+
     token_num = inter_states.shape[0]
-    E = w2.shape[0]
-    model_dim = w2.shape[1]
+    E = _total_experts
+    model_dim = w2_list[0].shape[1]
     inter_dim = inter_states.shape[2]
 
     accumulate = mode != "reduce"
@@ -738,9 +808,13 @@ def flydsl_moe_stage2(
     flat_a_scale = (
         a2_scale.view(-1) if a2_scale is not None else torch.empty(0, device=dev)
     )
-    flat_w_scale = (
-        w2_scale.view(-1) if w2_scale is not None else torch.empty(0, device=dev)
-    )
+    # Use uint8 for padding to avoid dlpack issues with fp4 types
+    _empty_w2 = torch.empty(0, device=dev, dtype=torch.uint8)
+    _w2_padded = [_wt.view(-1) for _wt in w2_list] + [_empty_w2] * (4 - num_b_tensors)
+    _empty_ws2 = torch.empty(0, device=dev)
+    _ws2_padded = [
+        (_ws.view(-1) if _ws is not None else _empty_ws2) for _ws in w2_scale_list
+    ] + [_empty_ws2] * (4 - num_b_tensors)
     sw = (
         sorted_weights
         if sorted_weights is not None
@@ -776,9 +850,9 @@ def flydsl_moe_stage2(
         args = _s2_args_fp4(
             target,
             inter_states,
-            w2,
+            _w2_padded,
             flat_a_scale,
-            flat_w_scale,
+            _ws2_padded,
             sorted_token_ids,
             sorted_expert_ids,
             sw,
@@ -793,9 +867,9 @@ def flydsl_moe_stage2(
         args = _s2_args_std(
             target,
             inter_states,
-            w2,
+            _w2_padded,
             flat_a_scale,
-            flat_w_scale,
+            _ws2_padded,
             sorted_token_ids,
             sorted_expert_ids,
             sw,
@@ -821,6 +895,8 @@ def flydsl_moe_stage2(
         accumulate=accumulate,
         persist_m=_persist_m,
         sort_block_m=sort_block_m,
+        num_b_tensors=num_b_tensors,
+        b_tensor_l_offsets=b_tensor_l_offsets,
     )
     _run_compiled(exe, args)
 
