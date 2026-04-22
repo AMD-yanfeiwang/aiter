@@ -960,6 +960,7 @@ def flydsl_moe_stage2(
     _run_compiled(exe, args)
 
     if not accumulate:
-        torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
+        from aiter.ops.flydsl.topk_sum import topk_sum
+        topk_sum(target, token_num, topk, model_dim, out)
 
     return out
