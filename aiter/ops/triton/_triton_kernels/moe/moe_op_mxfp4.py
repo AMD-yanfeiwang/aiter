@@ -171,6 +171,8 @@ def _fused_moe_kernel_mxfp4(
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     token_mask = offs_token < num_valid_tokens
+    # Clamp padding entries to 0 to avoid OOB pointer computation on AMD GPUs
+    offs_token = tl.where(token_mask, offs_token, tl.zeros_like(offs_token))
 
     off_expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_expert == -1:

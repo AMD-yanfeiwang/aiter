@@ -961,12 +961,17 @@ def _fused_dynamic_mxfp4_quant_moe_sort_kernel(
         x_offs_m = sorted_ids
     else:
         x_offs_m = sorted_ids * TOPK + topk_ids
-    # if pid == 0:
-    #     tl.device_print("x_offs_m", x_offs_m)
+    # x_offs_m = token_id * TOPK + topk_id is the logical sorted output position.
+    # For stage 2 (x has M*topk rows), x_offs_m < Mx and is the correct input row.
+    # For stage 1 (x has M rows), x_offs_m can exceed Mx; use token_id (sorted_ids)
+    # as input row since all topk slots of the same token read the same input data.
+    # Clamp padding entries to row 0 to prevent GPU faults on AMD
+    # (masked loads can still fault on unmapped addresses).
+    input_row = tl.where(x_offs_m < Mx, x_offs_m, sorted_ids)
+    input_row_safe = tl.where(sorted_ids < token_num, input_row, tl.zeros_like(input_row))
     x_offs_n = pid_n * BLOCK_SIZE_Nb + tl.arange(0, BLOCK_SIZE_Nb)
-    x_offs = x_offs_m[:, None] * stride_x_m + x_offs_n[None, :] * stride_x_n
+    x_offs = input_row_safe[:, None] * stride_x_m + x_offs_n[None, :] * stride_x_n
     x_mask = (sorted_ids < token_num)[:, None] & (x_offs_n < Nx)[None, :]
-    # x_mask = (x_offs_m < Mx)[:, None] & (x_offs_n < Nx)[None, :]
     x = tl.load(x_ptr + x_offs, mask=x_mask).to(tl.float32)
     x = x.reshape(BLOCK_SIZE_M * 2, BLOCK_SIZE_N * 2, MXFP4_QUANT_BLOCK_SIZE)
 

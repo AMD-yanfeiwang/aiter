@@ -714,11 +714,15 @@ def _fused_quant_fp8_sort_kernel(
         else:
             original_m_idx = token_ids * TOPK + topk_ids
 
+        # Clamp OOB row indices to 0 for address computation to prevent GPU page faults
+        # on AMD (masked loads can still fault on unmapped addresses)
+        safe_m_idx = tl.where(original_m_idx < M_input, original_m_idx, tl.zeros_like(original_m_idx))
+
         input_offs_n = (pid_n * BLOCK_SIZE_N + n) * QUANT_BLOCK_SIZE + tl.arange(
             0, BLOCK_SIZE_N * QUANT_BLOCK_SIZE
         )
         input_offs = (
-            original_m_idx[:, None] * stride_input_m
+            safe_m_idx[:, None] * stride_input_m
             + input_offs_n[None, :] * stride_input_n
         )
         input_mask = (original_m_idx < M_input)[:, None] & (input_offs_n < N_input)[

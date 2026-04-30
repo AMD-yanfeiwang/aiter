@@ -144,6 +144,21 @@ def fused_moe(
 ):
     if not block_size_M:
         block_size_M = -1
+    # Multi-B dispatch: when w1 is a list of tensors (DWDP mode),
+    # use the Triton multi-B kernel path
+    if isinstance(w1, (list, tuple)):
+        return _fused_moe_multi_b_dispatch(
+            hidden_states=hidden_states,
+            w1_list=w1,
+            w2_list=w2,
+            topk_weight=topk_weight,
+            topk_ids=topk_ids,
+            activation=activation,
+            quant_type=quant_type,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            doweight_stage1=doweight_stage1,
+        )
     return fused_moe_(
         hidden_states=hidden_states,
         w1=w1,
@@ -1965,3 +1980,211 @@ def fused_topk(
     #     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     return topk_weights, topk_ids
+
+
+# ============================================================================
+# Multi-B Triton dispatch for DWDP (Zero-Copy)
+# =============================================================================
+
+
+def _fused_moe_multi_b_dispatch(
+    hidden_states,
+    w1_list,
+    w2_list,
+    topk_weight,
+    topk_ids,
+    activation=ActivationType.Silu,
+    quant_type=QuantType.No,
+    w1_scale=None,
+    w2_scale=None,
+    doweight_stage1=False,
+):
+    """Dispatch multi-B weights to Triton multi-B kernel (ZERO COPY).
+
+    Implements the full 2-stage MOE pipeline using the multi-B Triton kernel
+    for GEMM operations. NO torch.cat on weight tensors.
+
+    For MXFP4 (quant_type=per_1x32, uint8/fp4x2 weights):
+      Stage 1: hidden_states @ w1_list -> intermediate (gate+up)
+      Activation: SwiGLU (silu(gate) * up)
+      Stage 2: intermediate @ w2_list -> output (with topk weight reduction)
+    """
+    import torch.nn.functional as F
+    from aiter.ops.triton.moe.moe_op_mxfp4_multi_b import fused_moe_mxfp4_multi_b
+    from aiter.ops.triton.moe.moe_align_block_size import moe_align_block_size_triton
+    import triton.language as tl
+
+    M, topk = topk_ids.shape
+    device = hidden_states.device
+    dtype = hidden_states.dtype
+
+    # Handle fp4x2 dtype -> view as uint8 for kernel
+    w1_ref = w1_list[0]
+    w2_ref = w2_list[0]
+    if w1_ref.dtype == dtypes.fp4x2:
+        w1_list = [w.view(torch.uint8) for w in w1_list]
+        w2_list = [w.view(torch.uint8) for w in w2_list]
+        w1_ref = w1_list[0]
+        w2_ref = w2_list[0]
+
+    E = sum(w.shape[0] for w in w1_list)
+    N1 = w1_ref.shape[1]  # inter_dim * 2
+    K1_packed = w1_ref.shape[2]
+    N2 = w2_ref.shape[1]  # model_dim
+    K2_packed = w2_ref.shape[2]
+
+    # Determine dimensions
+    pack_factor = 2 if w1_ref.dtype == torch.uint8 else 1
+    model_dim = K1_packed * pack_factor
+    inter_dim = K2_packed * pack_factor
+
+    # ---- Token sorting ----
+    block_size_M = 32
+    num_valid_tokens = M * topk
+    max_num_tokens_padded = num_valid_tokens + E * block_size_M
+    sorted_token_ids = torch.full(
+        (max_num_tokens_padded,), num_valid_tokens,
+        dtype=torch.int32, device=device,
+    )
+    max_blocks = (max_num_tokens_padded + block_size_M - 1) // block_size_M
+    expert_ids_sorted = torch.full(
+        (max_blocks,), -1, dtype=torch.int32, device=device,
+    )
+    num_tokens_post_pad = torch.empty(1, dtype=torch.int32, device=device)
+
+    moe_align_block_size_triton(
+        topk_ids, E, block_size_M,
+        sorted_token_ids, expert_ids_sorted, num_tokens_post_pad,
+    )
+
+    # ---- Activation quantization ----
+    is_mxfp4 = (quant_type == QuantType.per_1x32 and w1_ref.dtype == torch.uint8)
+
+    if is_mxfp4:
+        from aiter.ops.triton.quant.fused_mxfp4_quant import (
+            fused_dynamic_mxfp4_quant_moe_sort,
+        )
+        a1_raw, a1_scale_raw = fused_dynamic_mxfp4_quant_moe_sort(
+            hidden_states,
+            sorted_ids=sorted_token_ids,
+            num_valid_ids=num_tokens_post_pad,
+            token_num=M,
+            topk=topk,
+            block_size=block_size_M,
+        )
+        a1 = a1_raw.view(torch.uint8)
+        a1_scale = a1_scale_raw.view(torch.uint8)
+        a_scale_scalar = torch.ones(1, dtype=torch.float32, device=device)
+    else:
+        a1 = hidden_states
+        a1_scale = None
+        a_scale_scalar = torch.ones(1, dtype=torch.float32, device=device)
+
+    # ---- Prepare microscales for stage 1 ----
+    if w1_scale is not None:
+        if isinstance(w1_scale, (list, tuple)):
+            w1_mx_list = [s.view(torch.uint8) if s.dtype != torch.uint8 else s
+                          for s in w1_scale]
+        else:
+            w1_mx_list = [w1_scale.view(torch.uint8) if w1_scale.dtype != torch.uint8 else w1_scale]
+    else:
+        # Dummy microscales
+        K_scale = K1_packed // 16
+        w1_mx_list = [torch.ones(w.shape[0], w.shape[1], K_scale,
+                                  dtype=torch.uint8, device=device) for w in w1_list]
+
+    b1_scale_list = [torch.ones(1, dtype=torch.float32, device=device)
+                     for _ in w1_list]
+
+    # ---- Stage 1 GEMM ----
+    compute_type = tl.bfloat16 if dtype == torch.bfloat16 else tl.float16
+    stage1_out = torch.zeros((M, topk, N1), dtype=dtype, device=device)
+
+    config = {
+        "BLOCK_SIZE_M": block_size_M,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 8,
+    }
+
+    fused_moe_mxfp4_multi_b(
+        A=a1,
+        B_list=w1_list,
+        C=stage1_out,
+        A_scale=a_scale_scalar,
+        B_scale_list=b1_scale_list,
+        A_mx_scale=a1_scale,
+        B_mx_scale_list=w1_mx_list,
+        topk_weights=topk_weight,
+        topk_ids=topk_ids,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids_sorted,
+        num_tokens_post_padded=num_tokens_post_pad,
+        mul_routed_weight=False,
+        top_k=topk,
+        config=config,
+        compute_type=compute_type,
+    )
+
+    # ---- Activation (SwiGLU) ----
+    gate = stage1_out[:, :, :N1 // 2]
+    up = stage1_out[:, :, N1 // 2:]
+    intermediate = F.silu(gate) * up  # [M, topk, inter_dim]
+
+    # ---- Intermediate quantization for stage 2 ----
+    if is_mxfp4:
+        intermediate_flat = intermediate.reshape(-1, inter_dim)
+        a2_raw, a2_scale_raw = fused_dynamic_mxfp4_quant_moe_sort(
+            intermediate_flat,
+            sorted_ids=sorted_token_ids,
+            num_valid_ids=num_tokens_post_pad,
+            token_num=M,
+            topk=topk,
+            block_size=block_size_M,
+        )
+        a2 = a2_raw.view(torch.uint8)
+        a2_scale = a2_scale_raw.view(torch.uint8)
+    else:
+        a2 = intermediate.reshape(-1, inter_dim)
+        a2_scale = None
+
+    # ---- Prepare microscales for stage 2 ----
+    if w2_scale is not None:
+        if isinstance(w2_scale, (list, tuple)):
+            w2_mx_list = [s.view(torch.uint8) if s.dtype != torch.uint8 else s
+                          for s in w2_scale]
+        else:
+            w2_mx_list = [w2_scale.view(torch.uint8) if w2_scale.dtype != torch.uint8 else w2_scale]
+    else:
+        K2_scale = K2_packed // 16
+        w2_mx_list = [torch.ones(w.shape[0], w.shape[1], K2_scale,
+                                  dtype=torch.uint8, device=device) for w in w2_list]
+
+    b2_scale_list = [torch.ones(1, dtype=torch.float32, device=device)
+                     for _ in w2_list]
+
+    # ---- Stage 2 GEMM ----
+    stage2_out = torch.zeros((M, topk, N2), dtype=dtype, device=device)
+
+    fused_moe_mxfp4_multi_b(
+        A=a2,
+        B_list=w2_list,
+        C=stage2_out,
+        A_scale=a_scale_scalar,
+        B_scale_list=b2_scale_list,
+        A_mx_scale=a2_scale,
+        B_mx_scale_list=w2_mx_list,
+        topk_weights=topk_weight,
+        topk_ids=topk_ids,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids_sorted,
+        num_tokens_post_padded=num_tokens_post_pad,
+        mul_routed_weight=True,
+        top_k=topk,
+        config=config,
+        compute_type=compute_type,
+    )
+
+    # ---- Reduce over topk ----
+    output = stage2_out.sum(dim=1)
+    return output
