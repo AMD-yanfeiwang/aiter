@@ -16,6 +16,69 @@
 #include "aiter_tensor.h"
 
 #include <cstddef>
+#include <cstdint>
+#include <type_traits>
+
+namespace {
+
+// Validates the optional output epilogue tensors and fills `epi` from them
+// (see opus_mla_v4_prefill_epilogue_args).
+void set_epilogue_args(opus_mla_v4_prefill_epilogue_args& epi,
+                       const std::optional<aiter_tensor_t>& positions,
+                       const std::optional<aiter_tensor_t>& freqs,
+                       const std::optional<aiter_tensor_t>& out_scale,
+                       int N,
+                       int H,
+                       int D)
+{
+    AITER_CHECK(positions.has_value() == freqs.has_value(),
+                "inv_rope_positions and inv_rope_freqs go together");
+    if(positions)
+    {
+        AITER_CHECK(positions->dtype() == AITER_DTYPE_i64 && positions->dim() == 1 &&
+                        positions->size(0) >= N && positions->is_contiguous(),
+                    "inv_rope_positions must be a contiguous int64 [>= N] tensor");
+        // read as 16B vectors
+        AITER_CHECK(freqs->dtype() == AITER_DTYPE_fp32 && freqs->dim() == 2 &&
+                        freqs->size(1) == 64 && freqs->stride(1) == 1 &&
+                        freqs->stride(0) % 4 == 0 &&
+                        reinterpret_cast<uintptr_t>(freqs->data_ptr()) % 16 == 0,
+                    "inv_rope_freqs must be fp32 [max_pos, 64] (view_as_real(freqs_cis)), "
+                    "16B-aligned rows with the last dim contiguous");
+        epi.positions         = reinterpret_cast<const int64_t*>(positions->data_ptr());
+        epi.rope_freqs        = reinterpret_cast<const float*>(freqs->data_ptr());
+        epi.stride_rope_freqs = static_cast<int>(freqs->stride(0));
+    }
+    if(out_scale)
+    {
+        // a head row's 4 scales may go out as one dword
+        AITER_CHECK(out_scale->dtype() == AITER_DTYPE_u8 && out_scale->is_contiguous() &&
+                        static_cast<int64_t>(out_scale->numel()) ==
+                            static_cast<int64_t>(N) * H * (D / 128) &&
+                        reinterpret_cast<uintptr_t>(out_scale->data_ptr()) % 4 == 0,
+                    "out_scale must be a contiguous, 4B-aligned uint8 tensor of "
+                    "N * H * D / 128 e8m0 scales");
+        epi.out_scale = reinterpret_cast<uint8_t*>(out_scale->data_ptr());
+    }
+}
+
+// Calls f(std::bool_constant<INV_ROPE>{}, std::bool_constant<OUT_MXFP8>{}).
+template <class F>
+void dispatch_epilogue(bool inv_rope, bool out_mxfp8, F&& f)
+{
+    using Off = std::false_type;
+    using On  = std::true_type;
+    if(!inv_rope && !out_mxfp8)
+        f(Off{}, Off{});
+    else if(!out_mxfp8)
+        f(On{}, Off{});
+    else if(inv_rope)
+        f(On{}, On{});
+    else
+        f(Off{}, On{});
+}
+
+} // namespace
 
 void opus_mla_v4_prefill_a16w16_gfx950_fwd(aiter_tensor_t& q,
                                            aiter_tensor_t& unified_kv,
@@ -26,7 +89,10 @@ void opus_mla_v4_prefill_a16w16_gfx950_fwd(aiter_tensor_t& q,
                                            aiter_tensor_t& kv_indptr_extend,
                                            aiter_tensor_t& attn_sink,
                                            aiter_tensor_t& out,
-                                           float softmax_scale)
+                                           float softmax_scale,
+                                           std::optional<aiter_tensor_t> inv_rope_positions,
+                                           std::optional<aiter_tensor_t> inv_rope_freqs,
+                                           std::optional<aiter_tensor_t> out_scale)
 {
     // ---- Shape / dtype validation -----------------------------------------
     AITER_CHECK(q.dim() == 3, "q must be 3-D [N, H, D], got ndim=", q.dim());
@@ -39,9 +105,14 @@ void opus_mla_v4_prefill_a16w16_gfx950_fwd(aiter_tensor_t& q,
     AITER_CHECK(out.dim() == 3, "out must be 3-D [N, H, D], got ndim=", out.dim());
     AITER_CHECK(attn_sink.dim() == 1, "attn_sink must be 1-D [H]");
 
-    AITER_CHECK(q.dtype() == kv.dtype() && q.dtype() == unified_kv.dtype() &&
-                    q.dtype() == out.dtype(),
-                "q/unified_kv/kv/out must share dtype");
+    const bool inv_rope  = inv_rope_positions.has_value();
+    const bool out_mxfp8 = out_scale.has_value();
+    AITER_CHECK(q.dtype() == kv.dtype() && q.dtype() == unified_kv.dtype(),
+                "q/unified_kv/kv must share dtype");
+    AITER_CHECK(out.dtype() == (out_mxfp8 ? AITER_DTYPE_fp8 : q.dtype()),
+                out_mxfp8 ? "out must be fp8 when out_scale is given" : "out must share q's dtype");
+    AITER_CHECK(!(inv_rope || out_mxfp8) || q.dtype() == AITER_DTYPE_bf16,
+                "the output epilogue (inv_rope / out_scale) is bf16-only");
     AITER_CHECK(q.dtype() == AITER_DTYPE_bf16 || q.dtype() == AITER_DTYPE_fp16,
                 "Only bf16/fp16 are supported");
     AITER_CHECK(attn_sink.dtype() == AITER_DTYPE_fp32, "attn_sink must be fp32");
@@ -83,7 +154,8 @@ void opus_mla_v4_prefill_a16w16_gfx950_fwd(aiter_tensor_t& q,
     if (N == 0) return;
 
     // ---- Build kernel args -----------------------------------------------
-    opus_mla_v4_prefill_kargs kargs{};
+    // The epilogue fields are only passed on when an epilogue is requested.
+    opus_mla_v4_prefill_epilogue_kargs<opus_mla_v4_prefill_kargs> kargs{};
     kargs.q_ptr             = q.data_ptr();
     kargs.unified_kv_ptr    = unified_kv.data_ptr();
     kargs.kv_ptr            = kv.data_ptr();
@@ -107,24 +179,35 @@ void opus_mla_v4_prefill_a16w16_gfx950_fwd(aiter_tensor_t& q,
                 "unified_kv and kv must share row stride along the D dim");
     kargs.softmax_scale     = softmax_scale;
 
+    set_epilogue_args(kargs, inv_rope_positions, inv_rope_freqs, out_scale, N, H, D);
+    AITER_CHECK(!out_mxfp8 || (out.stride(0) == q.stride(0) && out.stride(1) == q.stride(1)),
+                "fp8 out must share q's strides");
+
     // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-#define LAUNCH_OPUS_MLA_V4_PREFILL(KERNEL, TRAITS, KV_TILE, NUM_WARPS)               \
-    do {                                                                             \
-        auto launch = [&](auto dtype_tag) {                                          \
-            using Traits = TRAITS<16, KV_TILE, 512, NUM_WARPS, decltype(dtype_tag)>; \
-            const int num_h_blocks = ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M); \
-            dim3 grid(N, num_h_blocks, 1);                                           \
-            dim3 block(Traits::BLOCK_SIZE);                                          \
-            KERNEL<Traits><<<grid, block, 0, stream>>>(kargs);                       \
-            HIP_CALL_LAUNCH(hipGetLastError());                                      \
-        };                                                                           \
-        if(q.dtype() == AITER_DTYPE_bf16)                                            \
-            launch(bf16_t{});                                                        \
-        else                                                                         \
-            launch(fp16_t{});                                                        \
+#define LAUNCH_OPUS_MLA_V4_PREFILL(KERNEL, TRAITS, KV_TILE, NUM_WARPS)                   \
+    do {                                                                                 \
+        auto launch = [&](auto dtype_tag, auto inv_rope_c, auto out_mxfp8_c) {           \
+            using Traits = TRAITS<16, KV_TILE, 512, NUM_WARPS, decltype(dtype_tag)>;     \
+            constexpr bool INV_ROPE  = decltype(inv_rope_c)::value;                      \
+            constexpr bool OUT_MXFP8 = decltype(out_mxfp8_c)::value;                     \
+            using KArgs = opus_mla_v4_prefill_kargs_t<opus_mla_v4_prefill_kargs,         \
+                                                      INV_ROPE || OUT_MXFP8>;            \
+            const int num_h_blocks = ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M);     \
+            dim3 grid(N, num_h_blocks, 1);                                               \
+            dim3 block(Traits::BLOCK_SIZE);                                              \
+            KERNEL<Traits, INV_ROPE, OUT_MXFP8>                                          \
+                <<<grid, block, 0, stream>>>(static_cast<const KArgs&>(kargs));          \
+            HIP_CALL_LAUNCH(hipGetLastError());                                          \
+        };                                                                               \
+        if(q.dtype() == AITER_DTYPE_fp16)                                                \
+            launch(fp16_t{}, std::false_type{}, std::false_type{});                      \
+        else                                                                             \
+            dispatch_epilogue(inv_rope, out_mxfp8, [&](auto r, auto m) {                 \
+                launch(bf16_t{}, r, m);                                                  \
+            });                                                                          \
     } while(0)
 
     // 16mx8_32nx1 (T_M=NUM_WARPS) for H > 32; 16mx1_16nx4 (T_M=1) for H <= 32.
@@ -150,7 +233,10 @@ void opus_mla_v4_prefill_a8w8_gfx950_fwd(aiter_tensor_t& q_nope,
                                          aiter_tensor_t& kv_indptr_extend,
                                          aiter_tensor_t& attn_sink,
                                          aiter_tensor_t& out,
-                                         float softmax_scale)
+                                         float softmax_scale,
+                                         std::optional<aiter_tensor_t> inv_rope_positions,
+                                         std::optional<aiter_tensor_t> inv_rope_freqs,
+                                         std::optional<aiter_tensor_t> out_scale)
 {
     // Single compiled configuration: split NoPE fp8 (448 + 14 E8M0 scales + pad
     // = 512 fp8 slots/row) and RoPE bf16 (64), D_HEAD = 512.
@@ -179,7 +265,10 @@ void opus_mla_v4_prefill_a8w8_gfx950_fwd(aiter_tensor_t& q_nope,
     AITER_CHECK(q_rope.dtype() == AITER_DTYPE_bf16 && unified_kv_rope.dtype() == AITER_DTYPE_bf16 &&
                     kv_rope.dtype() == AITER_DTYPE_bf16,
                 "q_rope/unified_kv_rope/kv_rope must be bf16");
-    AITER_CHECK(out.dtype() == AITER_DTYPE_bf16, "out must be bf16");
+    const bool inv_rope  = inv_rope_positions.has_value();
+    const bool out_mxfp8 = out_scale.has_value();
+    AITER_CHECK(out.dtype() == (out_mxfp8 ? AITER_DTYPE_fp8 : AITER_DTYPE_bf16),
+                out_mxfp8 ? "out must be fp8 when out_scale is given" : "out must be bf16");
     AITER_CHECK(attn_sink.dtype() == AITER_DTYPE_fp32, "attn_sink must be fp32");
 
     AITER_CHECK(kv_indptr_prefix.dtype() == AITER_DTYPE_i32, "kv_indptr_prefix must be int32");
@@ -238,7 +327,8 @@ void opus_mla_v4_prefill_a8w8_gfx950_fwd(aiter_tensor_t& q_nope,
                 "unified_kv_rope and kv_rope must share row stride");
 
     // ---- Build kernel args -----------------------------------------------
-    opus_mla_v4_prefill_fp8_kargs kargs{};
+    // The epilogue fields are only passed on when an epilogue is requested.
+    opus_mla_v4_prefill_epilogue_kargs<opus_mla_v4_prefill_fp8_kargs> kargs{};
     kargs.q_nope_ptr          = q_nope.data_ptr();
     kargs.q_rope_ptr          = q_rope.data_ptr();
     kargs.unified_kv_nope_ptr = unified_kv_nope.data_ptr();
@@ -264,20 +354,26 @@ void opus_mla_v4_prefill_a8w8_gfx950_fwd(aiter_tensor_t& q_nope,
     kargs.stride_kv_nope_page = stride_kv_nope_page;
     kargs.stride_kv_rope_page = stride_kv_rope_page;
     kargs.softmax_scale       = softmax_scale;
+    set_epilogue_args(kargs, inv_rope_positions, inv_rope_freqs, out_scale, N, H, D_HEAD);
 
     // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q_nope.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-#define LAUNCH_OPUS_MLA_V4_PREFILL_FP8(KERNEL, TRAITS, KV_TILE, NUM_WARPS)         \
-    do {                                                                          \
-        using KTraits = TRAITS<16, KV_TILE, NUM_WARPS, fp8_t, bf16_t, bf16_t>;    \
-        const int num_h_blocks = ceil_div(H, KTraits::Q_TILE_SIZE * KTraits::T_M);\
-        dim3 grid(N, num_h_blocks, 1);                                            \
-        dim3 block(KTraits::BLOCK_SIZE);                                          \
-        KERNEL<KTraits><<<grid, block, 0, stream>>>(kargs);                       \
-        HIP_CALL_LAUNCH(hipGetLastError());                                       \
-    } while(0)
+#define LAUNCH_OPUS_MLA_V4_PREFILL_FP8(KERNEL, TRAITS, KV_TILE, NUM_WARPS)                 \
+    dispatch_epilogue(inv_rope, out_mxfp8, [&](auto inv_rope_c, auto out_mxfp8_c) {       \
+        using KTraits = TRAITS<16, KV_TILE, NUM_WARPS, fp8_t, bf16_t, bf16_t>;            \
+        constexpr bool INV_ROPE  = decltype(inv_rope_c)::value;                           \
+        constexpr bool OUT_MXFP8 = decltype(out_mxfp8_c)::value;                          \
+        using KArgs = opus_mla_v4_prefill_kargs_t<opus_mla_v4_prefill_fp8_kargs,          \
+                                                  INV_ROPE || OUT_MXFP8>;                 \
+        const int num_h_blocks = ceil_div(H, KTraits::Q_TILE_SIZE * KTraits::T_M);        \
+        dim3 grid(N, num_h_blocks, 1);                                                    \
+        dim3 block(KTraits::BLOCK_SIZE);                                                  \
+        KERNEL<KTraits, INV_ROPE, OUT_MXFP8>                                              \
+            <<<grid, block, 0, stream>>>(static_cast<const KArgs&>(kargs));               \
+        HIP_CALL_LAUNCH(hipGetLastError());                                               \
+    })
 
     // 16mx8_32nx1 (T_M=NUM_WARPS) for H > 32; 16mx1_16nx4 (T_M=1) for H <= 32.
     if(H <= 32)

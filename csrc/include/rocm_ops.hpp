@@ -1493,7 +1493,10 @@ namespace py = pybind11;
           py::arg("kv_indptr_extend"),              \
           py::arg("attn_sink"),                     \
           py::arg("out"),                           \
-          py::arg("softmax_scale"));                \
+          py::arg("softmax_scale"),                 \
+          py::arg("inv_rope_positions") = std::nullopt, \
+          py::arg("inv_rope_freqs")     = std::nullopt, \
+          py::arg("out_scale")          = std::nullopt); \
     m.def("pa_sparse_prefill_gfx1250_opus_fwd",     \
           &opus_mla_v4_prefill_a16w16_gfx1250_fwd,  \
           py::arg("q"),                             \
@@ -1520,7 +1523,10 @@ namespace py = pybind11;
           py::arg("kv_indptr_extend"),              \
           py::arg("attn_sink"),                     \
           py::arg("out"),                           \
-          py::arg("softmax_scale"));                \
+          py::arg("softmax_scale"),                 \
+          py::arg("inv_rope_positions") = std::nullopt, \
+          py::arg("inv_rope_freqs")     = std::nullopt, \
+          py::arg("out_scale")          = std::nullopt); \
     m.def("pa_sparse_prefill_fp8_gfx1250_opus_fwd", \
           &opus_mla_v4_prefill_a8w8_gfx1250_fwd,    \
           py::arg("q_nope"),                        \

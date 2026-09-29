@@ -12,6 +12,8 @@
 #pragma once
 #include "aiter_tensor.h"
 #include <opus/dtypes.hpp>
+#include <optional>
+#include <type_traits>
 
 // Public API: prefill attention over two CSR ranges (prefix + extend).
 //
@@ -30,6 +32,13 @@
 // One entry point per target: gfx950 runs the kernel compiled from the device
 // templates below, gfx1250 runs a prebuilt code object. The Python layer picks
 // one based on the running GPU.
+//
+// gfx950 bf16 only, optional output epilogue (see opus_mla_v4_prefill_epilogue_args):
+//   inv_rope_positions : [>= N] int64, with
+//   inv_rope_freqs     : [max_pos, 64] fp32 view_as_real(freqs_cis): inverse RoPE
+//                        of the trailing 64 lanes of every head.
+//   out_scale          : [N * H * D / 128] uint8: out is fp8 e4m3fn (mxfp8, e8m0
+//                        scale per 128 lanes of a head row).
 void opus_mla_v4_prefill_a16w16_gfx950_fwd(aiter_tensor_t& q,
                                            aiter_tensor_t& unified_kv,
                                            aiter_tensor_t& kv_indices_prefix,
@@ -39,7 +48,10 @@ void opus_mla_v4_prefill_a16w16_gfx950_fwd(aiter_tensor_t& q,
                                            aiter_tensor_t& kv_indptr_extend,
                                            aiter_tensor_t& attn_sink,
                                            aiter_tensor_t& out,
-                                           float softmax_scale);
+                                           float softmax_scale,
+                                           std::optional<aiter_tensor_t> inv_rope_positions = std::nullopt,
+                                           std::optional<aiter_tensor_t> inv_rope_freqs     = std::nullopt,
+                                           std::optional<aiter_tensor_t> out_scale          = std::nullopt);
 
 // gfx1250: only the bf16 variant is built into the code object.
 void opus_mla_v4_prefill_a16w16_gfx1250_fwd(aiter_tensor_t& q,
@@ -72,6 +84,7 @@ void opus_mla_v4_prefill_a16w16_gfx1250_fwd(aiter_tensor_t& q,
 //   attn_sink          : [H] fp32 (per-head softmax-denominator bias)
 //   out                : [N, H, 512] bf16 (caller-allocated)
 // `softmax_scale` is forwarded to the kernel as-is (no implicit 1/sqrt(D)).
+// gfx950: same optional output epilogue as the a16w16 entry point.
 void opus_mla_v4_prefill_a8w8_gfx950_fwd(aiter_tensor_t& q_nope,
                                          aiter_tensor_t& q_rope,
                                          aiter_tensor_t& unified_kv_nope,
@@ -84,7 +97,10 @@ void opus_mla_v4_prefill_a8w8_gfx950_fwd(aiter_tensor_t& q_nope,
                                          aiter_tensor_t& kv_indptr_extend,
                                          aiter_tensor_t& attn_sink,
                                          aiter_tensor_t& out,
-                                         float softmax_scale);
+                                         float softmax_scale,
+                                         std::optional<aiter_tensor_t> inv_rope_positions = std::nullopt,
+                                         std::optional<aiter_tensor_t> inv_rope_freqs     = std::nullopt,
+                                         std::optional<aiter_tensor_t> out_scale          = std::nullopt);
 
 void opus_mla_v4_prefill_a8w8_gfx1250_fwd(aiter_tensor_t& q_nope,
                                           aiter_tensor_t& q_rope,
@@ -163,6 +179,34 @@ struct opus_mla_v4_prefill_fp8_kargs
     int stride_kv_rope_page;
     float softmax_scale;
 };
+
+// Optional output epilogue of the gfx950 kernels, applied to the fp32 O tile
+// before the store:
+//   INV_ROPE:  inverse GPT-J (interleaved) RoPE of the trailing 64 lanes of every
+//              head row: even' = e*cos + o*sin, odd' = o*cos - e*sin, with
+//              rope_freqs[positions[token]] = view_as_real(freqs_cis) row
+//              (cos at 2k, sin at 2k+1).
+//   OUT_MXFP8: out is fp8 e4m3fn; each 128-lane group of a head row gets the e8m0
+//              scale ceil_to_ue8m0(max(amax / 448, 1e-10)), stored at
+//              out_scale[(token * H + head) * D / 128 + group].
+// The fields ride in a struct derived from the kernel's kargs, so the kargs keep
+// the gfx1250 code object ABI and kernels without epilogue their kernarg layout.
+struct opus_mla_v4_prefill_epilogue_args
+{
+    const int64_t* __restrict__ positions; // [N]
+    const float* __restrict__ rope_freqs;  // [max_pos, 64] fp32
+    uint8_t* __restrict__ out_scale;       // [N, H, D / 128] e8m0
+    int stride_rope_freqs;
+};
+
+template <class KArgs>
+struct opus_mla_v4_prefill_epilogue_kargs : KArgs, opus_mla_v4_prefill_epilogue_args
+{
+};
+
+template <class KArgs, bool EPILOGUE>
+using opus_mla_v4_prefill_kargs_t =
+    std::conditional_t<EPILOGUE, opus_mla_v4_prefill_epilogue_kargs<KArgs>, KArgs>;
 
 // Compile-time tile/MFMA configuration for the 16mx8_32nx1 variant (T_M=NUM_WARPS,
 // T_N=1). Used when H > 32. KV_TILE=32, NUM_WARPS=8, BLOCK_SIZE=512.
@@ -473,31 +517,31 @@ struct opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits
 __host__ __device__ inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
 // Device kernel templates — declared here, defined in the device pass below.
-template <class Traits>
-__global__ void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(opus_mla_v4_prefill_kargs kargs);
-template <class Traits>
-__global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs kargs);
-template <class Traits>
-__global__ void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
-template <class Traits>
-__global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
+template <class Traits, bool INV_ROPE = false, bool OUT_MXFP8 = false>
+__global__ void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(opus_mla_v4_prefill_kargs_t<opus_mla_v4_prefill_kargs, INV_ROPE || OUT_MXFP8> kargs);
+template <class Traits, bool INV_ROPE = false, bool OUT_MXFP8 = false>
+__global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs_t<opus_mla_v4_prefill_kargs, INV_ROPE || OUT_MXFP8> kargs);
+template <class Traits, bool INV_ROPE = false, bool OUT_MXFP8 = false>
+__global__ void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(opus_mla_v4_prefill_kargs_t<opus_mla_v4_prefill_fp8_kargs, INV_ROPE || OUT_MXFP8> kargs);
+template <class Traits, bool INV_ROPE = false, bool OUT_MXFP8 = false>
+__global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs_t<opus_mla_v4_prefill_fp8_kargs, INV_ROPE || OUT_MXFP8> kargs);
 
 // Pull in the device kernel template bodies only on the gfx950 device pass.
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
-template <class Traits>
-__global__ void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(opus_mla_v4_prefill_kargs)
+template <class Traits, bool INV_ROPE, bool OUT_MXFP8>
+__global__ void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(opus_mla_v4_prefill_kargs_t<opus_mla_v4_prefill_kargs, INV_ROPE || OUT_MXFP8>)
 {
 }
-template <class Traits>
-__global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs)
+template <class Traits, bool INV_ROPE, bool OUT_MXFP8>
+__global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs_t<opus_mla_v4_prefill_kargs, INV_ROPE || OUT_MXFP8>)
 {
 }
-template <class Traits>
-__global__ void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(opus_mla_v4_prefill_fp8_kargs)
+template <class Traits, bool INV_ROPE, bool OUT_MXFP8>
+__global__ void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(opus_mla_v4_prefill_kargs_t<opus_mla_v4_prefill_fp8_kargs, INV_ROPE || OUT_MXFP8>)
 {
 }
-template <class Traits>
-__global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs)
+template <class Traits, bool INV_ROPE, bool OUT_MXFP8>
+__global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs_t<opus_mla_v4_prefill_fp8_kargs, INV_ROPE || OUT_MXFP8>)
 {
 }
 #else
@@ -576,6 +620,102 @@ template<opus::index_t VEC, class D>
 __device__ inline auto global_load(const D* g_base, opus::index_t os) {
     return *reinterpret_cast<const opus::vector_t<D, VEC>*>(
         reinterpret_cast<const char*>(g_base) + static_cast<int64_t>(os) * static_cast<int64_t>(sizeof(D)));
+}
+
+// =============================================================================
+// Output epilogue (opus_mla_v4_prefill_epilogue_args), shared by all variants.
+// In both O layout families a thread owns one head row and, of every 16-lane
+// block, the 4 lanes at (lane_id / 16) * 4; consecutive VEC_O slices of v_o are
+// consecutive blocks, so lane pairs never straddle threads and the other lanes
+// of a block sit in the threads 16/32/48 lanes away.
+// =============================================================================
+constexpr int OPUS_MLA_V4_ROPE_DIM = 64;
+constexpr int OPUS_MLA_V4_MX_GROUP = 128;
+
+// Inverse RoPE of the 64 rope lanes, held at v_o[OFF, OFF + 16) as 4 blocks.
+// fr_row is rope_freqs[position]; rope lane r is paired with its cos/sin at
+// fr_row[r] / fr_row[r + 1] (r even), so one 16B load covers a thread's block.
+template<int OFF, class V>
+__device__ inline void epi_inv_rope(V& v_o, const float* fr_row, int lane_id) {
+    const float* fr = fr_row + (lane_id / 16) * 4;
+    opus::static_for<OPUS_MLA_V4_ROPE_DIM / 16>([&](auto b) {
+        const auto cs = *reinterpret_cast<const opus::vector_t<float, 4>*>(fr + b.value * 16);
+        opus::static_for<2>([&](auto p) {
+            constexpr int i = OFF + b.value * 4 + p.value * 2;
+            const float c = cs[p.value * 2], s = cs[p.value * 2 + 1];
+            const float e = v_o[i], o = v_o[i + 1];
+            v_o[i]     = e * c + o * s;
+            v_o[i + 1] = o * c - e * s;
+        });
+    });
+}
+
+// mxfp8 quant of one 128-lane group whose thread-local part is v[OFF, OFF + CNT):
+// reduces amax over the 4 threads sharing the row, scales v in place into the
+// e4m3 range and returns the e8m0 exponent. Same arithmetic as sglang's
+// _wo_a_quant_mxfp8_kernel (ceil_to_ue8m0, clamp [1, 254]), from fp32.
+template<int OFF, int CNT, class V>
+__device__ inline uint32_t epi_mx_quant_group(V& v) {
+    float amax = 0.0f;
+    opus::static_for<CNT>([&](auto i) { amax = max(amax, __builtin_fabsf(v[OFF + i.value])); });
+    opus::vector_t<opus::u32_t, 2> r32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<opus::u32_t>(amax), std::bit_cast<opus::u32_t>(amax), false, true);
+    amax = max(std::bit_cast<float>(r32.x), std::bit_cast<float>(r32.y));
+    opus::vector_t<opus::u32_t, 2> r16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(amax), std::bit_cast<opus::u32_t>(amax), false, true);
+    amax = max(std::bit_cast<float>(r16.x), std::bit_cast<float>(r16.y));
+    // amax / 448 rounded like an IEEE division (-ffast-math would use the
+    // reciprocal, and the ceil below is sensitive to the last ulp): quotient by
+    // 7 with one fma residual correction, then an exact scale by 2^-6.
+    constexpr float RCP7 = 1.0f / 7.0f;
+    const float q7  = amax * RCP7;
+    const float q7c = __builtin_fmaf(__builtin_fmaf(-q7, 7.0f, amax), RCP7, q7);
+    const float raw = max(q7c * 0.015625f, 1e-10f);
+    const uint32_t bits = std::bit_cast<uint32_t>(raw);
+    const uint32_t e = min(max((bits >> 23) + ((bits & 0x7fffffu) != 0u), 1u), 254u);
+    const float inv_scale = std::bit_cast<float>((254u - e) << 23); // 2^(127 - e), exact
+    opus::static_for<CNT>([&](auto i) {
+        v[OFF + i.value] = min(max(v[OFF + i.value] * inv_scale, -448.0f), 448.0f);
+    });
+    return e;
+}
+
+// Epilogue of the 16mx8_32nx1 O layouts: the thread holds a quarter of its head
+// row, i.e. a quarter of each of the D / 128 = 4 mx groups.
+template<class T, bool INV_ROPE, bool OUT_MXFP8, class KArgs, class V>
+__device__ inline void epi_16mx8(V& v_o, const KArgs& kargs, int token, int head, int lane_id) {
+    constexpr int O_LEN = opus::vector_traits<V>::size();
+    if constexpr (INV_ROPE) {
+        epi_inv_rope<O_LEN - OPUS_MLA_V4_ROPE_DIM / 4>(
+            v_o, kargs.rope_freqs + kargs.positions[token] * kargs.stride_rope_freqs, lane_id);
+    }
+    if constexpr (OUT_MXFP8) {
+        constexpr int NUM_GROUPS = O_LEN * 4 / OPUS_MLA_V4_MX_GROUP;
+        static_assert(NUM_GROUPS == 4, "the 4 e8m0 scales of a head row go out as one dword");
+        uint32_t scales = 0;
+        opus::static_for<NUM_GROUPS>([&](auto g) {
+            constexpr int CNT = O_LEN / NUM_GROUPS;
+            scales |= epi_mx_quant_group<g.value * CNT, CNT>(v_o) << (8 * g.value);
+        });
+        if (lane_id < T::W_M && head < kargs.H)
+            *reinterpret_cast<uint32_t*>(kargs.out_scale + (static_cast<int64_t>(token) * kargs.H + head) * NUM_GROUPS) = scales;
+    }
+}
+
+// Epilogue of the 16mx1_16nx4 O layouts: warp w holds lanes [128 w, 128 w + 128)
+// of the head rows, i.e. exactly mx group w; the rope lanes all live in the last warp.
+template<class T, bool INV_ROPE, bool OUT_MXFP8, class KArgs, class V>
+__device__ inline void epi_16mx1(V& v_o, const KArgs& kargs, int token, int head, int warp_id, int lane_id) {
+    constexpr int O_LEN = opus::vector_traits<V>::size();
+    if constexpr (INV_ROPE) {
+        if (warp_id == T::T_N - 1)
+            epi_inv_rope<O_LEN - OPUS_MLA_V4_ROPE_DIM / 4>(
+                v_o, kargs.rope_freqs + kargs.positions[token] * kargs.stride_rope_freqs, lane_id);
+    }
+    if constexpr (OUT_MXFP8) {
+        static_assert(O_LEN * 4 == OPUS_MLA_V4_MX_GROUP, "one mx group per warp");
+        const uint32_t e = epi_mx_quant_group<0, O_LEN>(v_o);
+        if (lane_id < T::W_M && head < kargs.H)
+            kargs.out_scale[(static_cast<int64_t>(token) * kargs.H + head) * T::T_N + warp_id] = static_cast<uint8_t>(e);
+    }
 }
 
 // =============================================================================
@@ -1604,8 +1744,8 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
 } // namespace opus_mla_v4_prefill_a16w16_16mx8_32nx1
 
 // ─── PA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
-template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(opus_mla_v4_prefill_kargs kargs) {
+template<class Traits, bool INV_ROPE, bool OUT_MXFP8>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(opus_mla_v4_prefill_kargs_t<opus_mla_v4_prefill_kargs, INV_ROPE || OUT_MXFP8> kargs) {
     using namespace opus;
     using namespace opus_mla_v4_prefill_a16w16_16mx8_32nx1;
     using T = opus::remove_cvref_t<Traits>;
@@ -1688,13 +1828,16 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16
     D_ACC o_scale = (l_final > D_ACC(0.0f)) ? (alpha / l_final) : D_ACC(0.0f);
     scale_output_tile<T>(v_o, o_scale);
 
-    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.out_ptr) + qo_gmem_offset, (kargs.H - h_block_start) * kargs.stride_qo_h * sizeof(D_ATTN));
+    using D_OUT = std::conditional_t<OUT_MXFP8, fp8_t, D_ATTN>;
+    auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + qo_gmem_offset, (kargs.H - h_block_start) * kargs.stride_qo_h * sizeof(D_OUT));
     // Recompute lane/warp decomposition to prevent CSE with Q-load layout
     int lane_id_o = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id_o));
     int warp_id_o = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
     auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_qo_h);
-    auto v_o_attn = cast<D_ATTN>(v_o);
+    if constexpr (INV_ROPE || OUT_MXFP8)
+        epi_16mx8<T, INV_ROPE, OUT_MXFP8>(v_o, kargs, q_token_idx, sink_head_idx, lane_id_o);
+    auto v_o_attn = cast<D_OUT>(v_o);
     store<T::VEC_O>(g_o, v_o_attn, u_o);
 }
 
@@ -2102,8 +2245,8 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
 } // namespace opus_mla_v4_prefill_a16w16_16mx1_16nx4
 
 // ─── PA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
-template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs kargs) {
+template<class Traits, bool INV_ROPE, bool OUT_MXFP8>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs_t<opus_mla_v4_prefill_kargs, INV_ROPE || OUT_MXFP8> kargs) {
     using namespace opus;
     using namespace opus_mla_v4_prefill_a16w16_16mx1_16nx4;
     using T = opus::remove_cvref_t<Traits>;
@@ -2171,10 +2314,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16
     D_ACC o_scale = (l_final > D_ACC(0.0f)) ? (alpha / l_final) : D_ACC(0.0f);
     scale_output_tile<T>(v_o, o_scale);
 
-    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.out_ptr) + qo_gmem_offset, (kargs.H - h_block_start) * kargs.stride_qo_h * sizeof(D_ATTN));
+    using D_OUT = std::conditional_t<OUT_MXFP8, fp8_t, D_ATTN>;
+    auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + qo_gmem_offset, (kargs.H - h_block_start) * kargs.stride_qo_h * sizeof(D_OUT));
     int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
     auto u_o = make_layout_o<T>(warp_id, lane_id, kargs.stride_qo_h);
-    auto v_o_attn = cast<D_ATTN>(v_o);
+    if constexpr (INV_ROPE || OUT_MXFP8)
+        epi_16mx1<T, INV_ROPE, OUT_MXFP8>(v_o, kargs, q_token_idx, sink_head_idx, warp_id, lane_id);
+    auto v_o_attn = cast<D_OUT>(v_o);
     store<T::VEC_O>(g_o, v_o_attn, u_o);
 }
 
@@ -3604,8 +3750,8 @@ __device__ void mla_v4_prefill_accum_pipelined(
 } // namespace opus_mla_v4_prefill_a8w8_16mx8_32nx1
 
 
-template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(opus_mla_v4_prefill_fp8_kargs kargs) {
+template<class Traits, bool INV_ROPE, bool OUT_MXFP8>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(opus_mla_v4_prefill_kargs_t<opus_mla_v4_prefill_fp8_kargs, INV_ROPE || OUT_MXFP8> kargs) {
     using namespace opus;
     using namespace opus_mla_v4_prefill_a8w8_16mx8_32nx1;
     using T = opus::remove_cvref_t<Traits>;
@@ -3733,13 +3879,15 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w
     D_ACC o_scale = (l_final > D_ACC(0.0f)) ? (alpha / l_final) : D_ACC(0.0f);
     scale_output_tile<T>(v_o, o_scale);
 
-    using D_OUT = typename T::D_OUT;
+    using D_OUT = std::conditional_t<OUT_MXFP8, fp8_t, typename T::D_OUT>;
     const int64_t o_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_o_n + static_cast<int64_t>(h_block_start) * kargs.stride_o_h;
     auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset, (kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_OUT));
     int lane_id_o = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id_o));
     int warp_id_o = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
     auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_o_h);
+    if constexpr (INV_ROPE || OUT_MXFP8)
+        epi_16mx8<T, INV_ROPE, OUT_MXFP8>(v_o, kargs, q_token_idx, sink_head_idx, lane_id_o);
     auto v_o_out = cast<D_OUT>(v_o);
     store<T::VEC_O>(g_o, v_o_out, u_o);
 }
@@ -4251,8 +4399,8 @@ __device__ void mla_v4_prefill_accum_pipelined(
 
 } // namespace opus_mla_v4_prefill_a8w8_16mx1_16nx4
 
-template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs kargs) {
+template<class Traits, bool INV_ROPE, bool OUT_MXFP8>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs_t<opus_mla_v4_prefill_fp8_kargs, INV_ROPE || OUT_MXFP8> kargs) {
     using namespace opus;
     using namespace opus_mla_v4_prefill_a8w8_16mx1_16nx4;
     using T = opus::remove_cvref_t<Traits>;
@@ -4345,11 +4493,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w
     D_ACC o_scale = (l_final > D_ACC(0.0f)) ? (alpha / l_final) : D_ACC(0.0f);
     scale_output_tile<T>(v_o, o_scale);
 
-    using D_OUT = typename T::D_OUT;
+    using D_OUT = std::conditional_t<OUT_MXFP8, fp8_t, typename T::D_OUT>;
     const int64_t o_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_o_n + static_cast<int64_t>(h_block_start) * kargs.stride_o_h;
     auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset, (kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_OUT));
     int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
     auto u_o = make_layout_o<T>(warp_id, lane_id, kargs.stride_o_h);
+    if constexpr (INV_ROPE || OUT_MXFP8)
+        epi_16mx1<T, INV_ROPE, OUT_MXFP8>(v_o, kargs, q_token_idx, sink_head_idx, warp_id, lane_id);
     auto v_o_out = cast<D_OUT>(v_o);
     store<T::VEC_O>(g_o, v_o_out, u_o);
 }

@@ -677,6 +677,69 @@ def test_pa_sparse_prefill(prec, n, h, total_pages, total_tokens, mode):
     )
 
 
+def _inv_rope_ref(o: torch.Tensor, positions: torch.Tensor, freqs: torch.Tensor):
+    """fp32 inverse GPT-J RoPE of the trailing 64 lanes; freqs is
+    view_as_real(freqs_cis) [max_pos, 64] (cos at 2k, sin at 2k+1)."""
+    o = o.float().clone()
+    fr = freqs[positions].view(-1, 1, 32, 2)
+    e, od = o[..., -64::2], o[..., -63::2]
+    cos, sin = fr[..., 0], fr[..., 1]
+    o[..., -64::2], o[..., -63::2] = e * cos + od * sin, od * cos - e * sin
+    return o
+
+
+def _mxfp8_ref(x: torch.Tensor):
+    """ceil_to_ue8m0 mxfp8 of fp32 [N, H, 512]: (fp8 codes, e8m0 [N, H, 4])."""
+    g = x.reshape(*x.shape[:-1], -1, 128)
+    raw = (g.abs().amax(-1) / 448.0).clamp(min=1e-10)
+    bits = raw.view(torch.int32)
+    e = (((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).int()).clamp(1, 254)
+    q = (g / (e << 23).view(torch.float32)[..., None]).clamp(-448, 448)
+    return q.to(torch.float8_e4m3fn).reshape(x.shape), e.to(torch.uint8)
+
+
+@pytest.mark.parametrize("prec", _PYTEST_PRECS)
+@pytest.mark.parametrize("n,h", [(67, 16), (40, 8), (33, 64), (130, 128)])
+def test_pa_sparse_prefill_opus_epilogue(prec, n, h):
+    """inv_rope_* / out_scale epilogue == the plain kernel's output followed by
+    the inverse RoPE and the mxfp8 quant, computed from the fp32 accumulator."""
+    if _skip_if_unsupported(512) or _get_gpu_arch() != "gfx950":
+        return _skip("the output epilogue is gfx950-only")
+    total = 1024
+    if prec == "fp8":
+        inputs = _make_inputs_fp8(n, h, total, total, seed=n + h)["kernel"]
+        fn = pa_sparse_prefill_fp8_opus
+    else:
+        inputs = _make_inputs(n, h, 512, total, total, torch.bfloat16, seed=n + h)
+        fn = pa_sparse_prefill_opus
+    args = (*inputs.values(), 512**-0.5)
+    max_pos = 1 << 18
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, 64, 2).float() / 64))
+    angles = torch.outer(torch.arange(max_pos).float(), inv_freq)
+    freqs = torch.view_as_real(torch.polar(torch.ones_like(angles), angles))
+    freqs = freqs.flatten(-2).cuda()
+    positions = torch.randint(0, max_pos, (n,), device="cuda")
+
+    base = fn(*args)
+    rot = fn(*args, inv_rope_positions=positions, inv_rope_freqs=freqs)
+    scale = torch.empty(n * h * 4, dtype=torch.uint8, device="cuda")
+    q8 = fn(*args, inv_rope_positions=positions, inv_rope_freqs=freqs, out_scale=scale)
+
+    ref = _inv_rope_ref(base, positions, freqs)
+    assert torch.equal(rot[..., :-64], base[..., :-64])  # NoPE lanes untouched
+    torch.testing.assert_close(rot.float(), ref, rtol=1e-2, atol=1e-2)
+    # vs quantizing the bf16-rounded rotation: scales agree except on ties
+    _, ref_scale = _mxfp8_ref(rot.float())
+    scale = scale.view(n, h, 4)
+    assert (scale != ref_scale).float().mean() < 0.01
+    deq = (
+        q8.float().view(n, h, 4, 128)
+        * (scale.int() << 23).view(torch.float32)[..., None]
+    )
+    err = (deq.view(n, h, 512) - ref).abs()
+    assert (err <= ref.abs() / 8 + 1e-3).all(), err.max()
+
+
 # ---------------------------------------------------------------------------
 # CLI (mirrors test_batch_prefill.py style).
 # ---------------------------------------------------------------------------
